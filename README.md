@@ -1,18 +1,17 @@
 # sir
 
-Minimal workspace wrapper for `jj` + Claude CLI in a raw terminal workflow.
+Minimal workspace wrapper for `git worktree` + Claude CLI in a raw terminal workflow.
 
 ## What It Does
 
 - Creates isolated workspaces under `repo/.worktrees/<name>/`
-- Uses `jj workspace add` as the backend (default)
+- Uses `git worktree` as the only backend
 - Delegates initialization copy and settle/integration to Claude CLI with `--dangerously-skip-permissions`
-- Runs agent commands directly in your current terminal (no zellij session management)
+- Runs agent commands directly in your current terminal
 
 ## Requirements
 
 - `git`
-- `jj` (if using `backend = "jj"`)
 - Claude CLI (`claude`)
 
 ## Install
@@ -45,14 +44,12 @@ Config file lookup order:
 Defaults:
 
 ```toml
-backend = "jj"
 claude_bin = "claude"
 ```
 
 Example:
 
 ```toml
-backend = "jj"
 claude_bin = "claude"
 ```
 
@@ -67,7 +64,7 @@ Checks include:
 - inside a git repo
 - `.worktrees/` exists (creates it if missing)
 - `.worktrees/` is gitignored
-- `jj` installed and workspace metadata available (for `backend = "jj"`)
+- `git worktree` support (`git worktree list`)
 - Claude CLI installed
 
 ### `sir spawn <name> <agent_cmd...>`
@@ -77,8 +74,15 @@ Creates/opens a workspace and then runs your agent command in that workspace in 
 Behavior:
 
 - Ensures `.worktrees/`
-- Creates workspace with:
-  - `jj workspace add --name <name> -r main repo/.worktrees/<name>`
+- Creates new worktrees from `HEAD`
+- Creates a worktree branch named `sir/<name>`:
+  - if branch exists: `git worktree add repo/.worktrees/<name> sir/<name>`
+  - else: `git worktree add -b sir/<name> repo/.worktrees/<name> HEAD`
+- Newly created worktrees are seeded with current uncommitted changes from the source repo by default
+  - applies tracked staged/unstaged diff from `HEAD`
+  - copies untracked files (excluding ignored files)
+  - if workspace already exists, seeding is skipped
+- If an existing workspace looks incomplete or not git-backed, `sir` auto-recreates it before running the agent command
 - Runs Claude init prompt from repo root to copy:
   - `.env` (if present, non-destructive)
   - `target/` (if present)
@@ -100,8 +104,8 @@ Stateless workspace listing from `.worktrees/` (excluding `_logs`, `_tmp`).
 For each workspace, prints:
 
 - name
-- backend detection (`jj`, `git`, `unknown`)
-- status summary (`jj st` or `git status -sb`)
+- backend detection (`git` or `unknown`)
+- status summary (`git status -sb`)
 
 Examples:
 
@@ -133,14 +137,13 @@ Behavior:
   - omitted name: inferred from current directory when inside `.worktrees/<name>`
 - Runs Claude in workspace with `--dangerously-skip-permissions`
 - Prompt instructs Claude to:
-  - inspect status/diff/log
+  - inspect status/diff/log with git
   - produce clean commit(s) and strong commit messages
-  - integrate/rebase onto latest `main`
+  - integrate/rebase/merge onto latest `main`
   - resolve conflicts
   - update `.env` when example env files changed (without overwriting secrets)
-- After Claude returns, prints post-checks:
+- After Claude returns, prints post-check:
   - `git status -sb` at repo root
-  - `jj st` at repo root (best effort)
 
 Examples:
 
@@ -152,7 +155,7 @@ cd .worktrees/foo && sir settle
 ## Notes
 
 - Workspace names cannot contain path separators and cannot be `_logs` or `_tmp`.
-- `backend = "git"` is reserved for future backend support; current implementation only provisions spawn with `jj`.
+- `sir` is git-only.
 
 ## Development
 

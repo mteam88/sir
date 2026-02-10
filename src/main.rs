@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -31,7 +31,7 @@ fn run() -> Result<()> {
 #[command(
     name = "sir",
     version,
-    about = "Small workspace wrapper for jj + Claude in the raw terminal"
+    about = "Small workspace wrapper for git worktrees + Claude in the raw terminal"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -59,38 +59,19 @@ enum Commands {
     Settle { name: Option<String> },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Backend {
-    Jj,
-    Git,
-}
-
-impl std::fmt::Display for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Jj => write!(f, "jj"),
-            Self::Git => write!(f, "git"),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Default)]
 struct PartialConfig {
-    backend: Option<Backend>,
     claude_bin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct Config {
-    backend: Backend,
     claude_bin: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            backend: Backend::Jj,
             claude_bin: "claude".to_string(),
         }
     }
@@ -107,9 +88,6 @@ impl Config {
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
             let parsed: PartialConfig = toml::from_str(&raw)
                 .with_context(|| format!("failed to parse config file {}", path.display()))?;
-            if let Some(backend) = parsed.backend {
-                config.backend = backend;
-            }
             if let Some(claude_bin) = parsed.claude_bin
                 && !claude_bin.trim().is_empty()
             {
@@ -133,6 +111,7 @@ fn config_paths() -> Vec<PathBuf> {
 }
 
 fn cmd_doctor(config: &Config) -> Result<()> {
+    progress("doctor: running environment checks");
     let mut checks = Vec::new();
     let mut failed = false;
 
@@ -182,40 +161,29 @@ fn cmd_doctor(config: &Config) -> Result<()> {
                 Some("echo '.worktrees/' >> .gitignore".to_string()),
             ));
         }
-    }
-
-    if matches!(config.backend, Backend::Jj) {
-        if binary_available("jj") {
-            checks.push(Check::ok(
-                "jj installed",
-                "`jj --version` works".to_string(),
-            ));
-            if let Some(root) = &repo_root {
-                let colocated = run_capture("jj", &["workspace", "list"], Some(root));
-                match colocated {
-                    Ok(output) if output.status.success() => {
-                        checks.push(Check::ok(
-                            "jj repo available",
-                            "workspace metadata detected".to_string(),
-                        ));
-                    }
-                    _ => {
-                        failed = true;
-                        checks.push(Check::fail(
-                            "jj repo available",
-                            "could not access jj workspace metadata in this repo".to_string(),
-                            Some("jj git init --colocate".to_string()),
-                        ));
-                    }
-                }
+        match run_capture("git", &["worktree", "list"], Some(root)) {
+            Ok(output) if output.status.success() => {
+                checks.push(Check::ok(
+                    "git worktree support",
+                    "`git worktree list` works".to_string(),
+                ));
             }
-        } else {
-            failed = true;
-            checks.push(Check::fail(
-                "jj installed",
-                "`jj` is not on PATH".to_string(),
-                Some("brew install jj".to_string()),
-            ));
+            Ok(output) => {
+                failed = true;
+                checks.push(Check::fail(
+                    "git worktree support",
+                    first_line(&output.stderr),
+                    Some("upgrade git to a version with worktree support".to_string()),
+                ));
+            }
+            Err(err) => {
+                failed = true;
+                checks.push(Check::fail(
+                    "git worktree support",
+                    err.to_string(),
+                    Some("ensure git is installed and callable".to_string()),
+                ));
+            }
         }
     }
 
@@ -258,54 +226,102 @@ fn cmd_doctor(config: &Config) -> Result<()> {
 }
 
 fn cmd_spawn(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
+    progress(&format!("spawn: preparing workspace `{name}`"));
     validate_workspace_name(name)?;
     let repo_root = repo_root()?;
     let (worktrees_dir, _) = ensure_worktrees_dir(&repo_root)?;
     let workspace_path = worktrees_dir.join(name);
+    let mut created_workspace = false;
 
-    if !workspace_path.exists() {
-        match config.backend {
-            Backend::Jj => {
-                let workspace_str = path_to_str(&workspace_path)?;
-                let output = run_capture(
-                    "jj",
-                    &[
-                        "workspace",
-                        "add",
-                        "--name",
-                        name,
-                        "-r",
-                        "main",
-                        workspace_str,
-                    ],
+    if workspace_path.is_dir() {
+        progress(&format!(
+            "spawn: inspecting existing workspace `{}`",
+            workspace_path.display()
+        ));
+        let backend = detect_workspace_backend(&workspace_path);
+        let metadata_only = workspace_is_metadata_only(&workspace_path)?;
+        let has_tracked =
+            workspace_has_tracked_content(&repo_root, &workspace_path).unwrap_or(true);
+        if backend != WorkspaceBackend::Git || metadata_only || !has_tracked {
+            let reason = if backend != WorkspaceBackend::Git {
+                "not a git worktree"
+            } else if metadata_only {
+                "only git metadata"
+            } else {
+                "no tracked repository files"
+            };
+            eprintln!("warning: workspace `{name}` appears incomplete ({reason}); recreating it");
+            if let Ok(workspace_str) = path_to_str(&workspace_path) {
+                let _ = run_capture(
+                    "git",
+                    &["worktree", "remove", "--force", workspace_str],
                     Some(&repo_root),
-                )?;
-                if !output.status.success() {
-                    if workspace_path.join(".jj").exists() {
-                        eprintln!(
-                            "warning: `jj workspace add` exited non-zero, but workspace `{name}` was created; continuing"
-                        );
-                    } else {
-                        bail!(
-                            "failed to create jj workspace `{name}`: {}",
-                            best_error_line(&output.stderr)
-                        );
-                    }
-                }
+                );
             }
-            Backend::Git => {
-                bail!("git backend is not implemented yet");
-            }
+            fs::remove_dir_all(&workspace_path).with_context(|| {
+                format!(
+                    "failed to remove incomplete workspace {}",
+                    workspace_path.display()
+                )
+            })?;
         }
     }
 
+    if !workspace_path.exists() {
+        progress("spawn: creating git worktree");
+        let revision = "HEAD".to_string();
+        let workspace_branch = format!("sir/{name}");
+        let workspace_str = path_to_str(&workspace_path)?;
+        let output = if git_branch_exists(&repo_root, &workspace_branch) {
+            run_capture(
+                "git",
+                &["worktree", "add", workspace_str, &workspace_branch],
+                Some(&repo_root),
+            )?
+        } else {
+            run_capture(
+                "git",
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &workspace_branch,
+                    workspace_str,
+                    &revision,
+                ],
+                Some(&repo_root),
+            )?
+        };
+        if !output.status.success() {
+            let error_line = best_error_line(&output.stderr);
+            if workspace_path.exists() {
+                let _ = run_capture(
+                    "git",
+                    &["worktree", "remove", "--force", workspace_str],
+                    Some(&repo_root),
+                );
+                let _ = fs::remove_dir_all(&workspace_path);
+            }
+            bail!("failed to create git worktree `{name}`: {error_line}");
+        }
+        created_workspace = true;
+    }
+
+    if created_workspace {
+        progress("spawn: applying uncommitted changes from source working tree");
+        apply_uncommitted_changes(&repo_root, &workspace_path)?;
+    }
+
+    progress("spawn: running initialization via Claude");
     let init_prompt = spawn_init_prompt(&workspace_path);
     run_claude(&config.claude_bin, &init_prompt, &repo_root)?;
 
+    progress("spawn: launching agent command");
     run_agent_command(agent_cmd, &workspace_path)
 }
 
 fn cmd_open(name: &str) -> Result<()> {
+    progress(&format!("open: resolving workspace `{name}`"));
     validate_workspace_name(name)?;
     let repo_root = repo_root()?;
     let workspace_path = repo_root.join(".worktrees").join(name);
@@ -317,6 +333,7 @@ fn cmd_open(name: &str) -> Result<()> {
 }
 
 fn cmd_status(as_json: bool) -> Result<()> {
+    progress("status: scanning workspaces");
     let repo_root = repo_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
     let entries = list_workspace_dirs(&worktrees_dir)?;
@@ -366,6 +383,7 @@ fn cmd_status(as_json: bool) -> Result<()> {
 }
 
 fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
+    progress("settle: resolving workspace");
     let repo_root = repo_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
 
@@ -382,9 +400,11 @@ fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
             .context("could not infer workspace name; pass one explicitly")?,
     };
 
+    progress("settle: running integration via Claude");
     let settle_prompt = settle_prompt(&name, &workspace_path);
     run_claude(&config.claude_bin, &settle_prompt, &workspace_path)?;
 
+    progress("settle: running post-checks");
     println!("\nPost-check:");
     match run_capture("git", &["status", "-sb"], Some(&repo_root)) {
         Ok(output) => {
@@ -392,15 +412,6 @@ fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
         }
         Err(err) => {
             println!("- git status -sb failed: {err}");
-        }
-    }
-
-    match run_capture("jj", &["st"], Some(&repo_root)) {
-        Ok(output) => {
-            print_command_output("jj st", &output.stdout, &output.stderr);
-        }
-        Err(_) => {
-            // JJ check is optional in post-check output.
         }
     }
 
@@ -468,7 +479,7 @@ fn spawn_init_prompt(workspace_path: &Path) -> String {
 
 fn settle_prompt(name: &str, workspace_path: &Path) -> String {
     format!(
-        "You are in workspace `{name}` at `{}`.\n\nGoal: integrate this workspace into main in a colocated jj+git repository.\n\nRequirements:\n- Inspect changes with jj status/diff/log.\n- Ensure changes are in a clean commit (or a small clean commit stack) with excellent commit message quality based on the diff intent.\n- Rebase/merge onto the latest main and resolve conflicts.\n- Integrate the result onto main using jj primitives suitable for a colocated repo.\n- If .env.example or any similar example-env file changed, update .env by adding new keys/defaults without overwriting existing secrets.\n- Leave the workspace and main in a sensible state.\n- Run commands directly with no follow-up questions unless absolutely blocked.",
+        "You are in workspace `{name}` at `{}`.\n\nGoal: integrate this workspace back into `main` using git.\n\nRequirements:\n- Inspect changes with git status/diff/log.\n- Ensure changes are in a clean commit (or a small clean commit stack) with excellent commit message quality based on the diff intent.\n- Rebase or merge onto the latest `main` and resolve conflicts.\n- Integrate the result onto `main` using git primitives.\n- If .env.example or any similar example-env file changed, update .env by adding new keys/defaults without overwriting existing secrets.\n- Leave the workspace and main in a sensible state.\n- Run commands directly with no follow-up questions unless absolutely blocked.",
         workspace_path.display()
     )
 }
@@ -477,6 +488,102 @@ fn run_claude(claude_bin: &str, prompt: &str, cwd: &Path) -> Result<()> {
     let args = ["-p", prompt, "--dangerously-skip-permissions"];
     run_stream(claude_bin, &args, Some(cwd))
         .with_context(|| format!("failed while running `{claude_bin}`"))
+}
+
+fn progress(message: &str) {
+    eprintln!("==> {message}");
+}
+
+fn apply_uncommitted_changes(repo_root: &Path, workspace_path: &Path) -> Result<()> {
+    let diff_output = run_capture("git", &["diff", "--binary", "HEAD"], Some(repo_root))
+        .context("failed to capture tracked uncommitted changes")?;
+    if !diff_output.status.success() {
+        bail!(
+            "failed to generate working-tree diff: {}",
+            best_error_line(&diff_output.stderr)
+        );
+    }
+
+    if !diff_output.stdout.trim().is_empty() {
+        let apply_output = run_capture_with_input(
+            "git",
+            &["apply", "--3way", "--whitespace=nowarn"],
+            Some(workspace_path),
+            diff_output.stdout.as_bytes(),
+        )
+        .context("failed to apply tracked changes to new workspace")?;
+        if !apply_output.status.success() {
+            bail!(
+                "failed to apply tracked changes: {}",
+                best_error_line(&apply_output.stderr)
+            );
+        }
+    }
+
+    let untracked_output = run_capture(
+        "git",
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        Some(repo_root),
+    )
+    .context("failed to list untracked files")?;
+    if !untracked_output.status.success() {
+        bail!(
+            "failed to list untracked files: {}",
+            best_error_line(&untracked_output.stderr)
+        );
+    }
+
+    let mut copied_untracked = 0usize;
+    for rel in untracked_output.stdout.split('\0') {
+        if rel.is_empty() {
+            continue;
+        }
+        let rel_path = Path::new(rel);
+        if !is_safe_repo_relative_path(rel_path) {
+            continue;
+        }
+        let src = repo_root.join(rel_path);
+        let dst = workspace_path.join(rel_path);
+        let metadata = match fs::symlink_metadata(&src) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::copy(&src, &dst).with_context(|| {
+            format!(
+                "failed to copy untracked file {} to {}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+        copied_untracked += 1;
+    }
+
+    if diff_output.stdout.trim().is_empty() && copied_untracked == 0 {
+        progress("spawn: no uncommitted changes found in source workspace");
+    } else if copied_untracked > 0 {
+        progress(&format!(
+            "spawn: copied {copied_untracked} untracked file(s) into new workspace"
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_safe_repo_relative_path(path: &Path) -> bool {
+    !path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
 }
 
 #[derive(Debug)]
@@ -531,9 +638,8 @@ struct JsonStatusRow {
     summary: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceBackend {
-    Jj,
     Git,
     Unknown,
 }
@@ -541,7 +647,6 @@ enum WorkspaceBackend {
 impl std::fmt::Display for WorkspaceBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Jj => write!(f, "jj"),
             Self::Git => write!(f, "git"),
             Self::Unknown => write!(f, "unknown"),
         }
@@ -549,9 +654,7 @@ impl std::fmt::Display for WorkspaceBackend {
 }
 
 fn detect_workspace_backend(path: &Path) -> WorkspaceBackend {
-    if path.join(".jj").exists() {
-        WorkspaceBackend::Jj
-    } else if path.join(".git").exists() {
+    if path.join(".git").exists() {
         WorkspaceBackend::Git
     } else {
         WorkspaceBackend::Unknown
@@ -560,11 +663,6 @@ fn detect_workspace_backend(path: &Path) -> WorkspaceBackend {
 
 fn workspace_status_summary(backend: WorkspaceBackend, workspace_path: &Path) -> String {
     match backend {
-        WorkspaceBackend::Jj => match run_capture("jj", &["st"], Some(workspace_path)) {
-            Ok(output) if output.status.success() => squash_status_lines(&output.stdout),
-            Ok(output) => format!("error: {}", first_line(&output.stderr)),
-            Err(err) => format!("error: {err}"),
-        },
         WorkspaceBackend::Git => match run_capture("git", &["status", "-sb"], Some(workspace_path))
         {
             Ok(output) if output.status.success() => squash_status_lines(&output.stdout),
@@ -692,6 +790,54 @@ fn list_workspace_dirs(worktrees_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
     Ok(entries)
 }
 
+fn workspace_is_metadata_only(workspace_path: &Path) -> Result<bool> {
+    if !workspace_path.is_dir() {
+        return Ok(false);
+    }
+
+    let mut saw_non_metadata_entry = false;
+    for entry in fs::read_dir(workspace_path)
+        .with_context(|| format!("failed to read workspace {}", workspace_path.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
+        saw_non_metadata_entry = true;
+        break;
+    }
+
+    Ok(!saw_non_metadata_entry)
+}
+
+fn workspace_has_tracked_content(repo_root: &Path, workspace_path: &Path) -> Result<bool> {
+    let output = run_capture("git", &["ls-files"], Some(repo_root))
+        .context("failed to list tracked files for workspace health check")?;
+    if !output.status.success() {
+        return Ok(true);
+    }
+
+    let mut saw_any_tracked = false;
+    for path in output
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        saw_any_tracked = true;
+        if workspace_path.join(path).exists() {
+            return Ok(true);
+        }
+    }
+
+    if !saw_any_tracked {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 fn infer_workspace_from_cwd(worktrees_dir: &Path) -> Option<(String, PathBuf)> {
     let cwd = env::current_dir().ok()?;
     if let Some(found) = infer_workspace_from_paths(worktrees_dir, &cwd) {
@@ -713,6 +859,21 @@ fn infer_workspace_from_paths(worktrees_dir: &Path, cwd: &Path) -> Option<(Strin
     let workspace_name = name.to_string_lossy().to_string();
     let workspace_path = worktrees_dir.join(&workspace_name);
     Some((workspace_name, workspace_path))
+}
+
+fn git_branch_exists(repo_root: &Path, branch: &str) -> bool {
+    run_capture(
+        "git",
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        Some(repo_root),
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 fn binary_available(bin: &str) -> bool {
@@ -739,6 +900,40 @@ fn run_capture(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<CmdOu
     let output = command
         .output()
         .with_context(|| format!("failed to run `{program}`"))?;
+
+    Ok(CmdOutput {
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn run_capture_with_input(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    input: &[u8],
+) -> Result<CmdOutput> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run `{program}`"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(input)
+            .with_context(|| format!("failed to write stdin to `{program}`"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for `{program}`"))?;
 
     Ok(CmdOutput {
         status: output.status,
