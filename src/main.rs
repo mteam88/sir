@@ -4,19 +4,20 @@ mod workspace_name;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use constants::{
-    DEFAULT_WORKSPACE_REVISION, PORCELAIN_STATUS_MIN_BYTES, RESERVED_WORKTREE_LOGS,
-    RESERVED_WORKTREE_TMP, STATUS_SUMMARY_MAX_LINES, STATUS_TRUNCATE_MAX_CHARS,
-    TRUNCATE_ELLIPSIS_CHARS,
-};
 use serde::{Deserialize, Serialize};
-use shell::{preferred_shell, shell_join, shell_quote};
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, ErrorKind, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use workspace_name::fallback_workspace_name;
+
+use constants::{
+    DEFAULT_WORKSPACE_REVISION, FALLBACK_NAME_MAX_RESERVATION_ATTEMPTS, PORCELAIN_STATUS_MIN_BYTES,
+    RESERVED_WORKTREE_LOGS, RESERVED_WORKTREE_TMP, STATUS_SUMMARY_MAX_LINES,
+    STATUS_TRUNCATE_MAX_CHARS, TRUNCATE_ELLIPSIS_CHARS,
+};
+use shell::{preferred_shell, shell_join, shell_quote};
+use workspace_name::fallback_workspace_name_candidate;
 
 fn main() {
     if let Err(err) = run() {
@@ -285,6 +286,12 @@ struct ParsedNewCommand {
     agent_cmd: Vec<String>,
 }
 
+#[derive(Debug)]
+struct ResolvedWorkspaceName {
+    name: String,
+    reserved: bool,
+}
+
 fn parse_new_command_args(
     name: Option<String>,
     from: Option<String>,
@@ -317,15 +324,17 @@ fn cmd_new(
 ) -> Result<()> {
     let repo_root = repo_root()?;
     let (worktrees_dir, _) = ensure_worktrees_dir(&repo_root)?;
-    let name =
+    let resolved_name =
         resolve_new_workspace_name(config, explicit_name, agent_cmd, &repo_root, &worktrees_dir)?;
+    let name = resolved_name.name;
+    let reserved_name = resolved_name.reserved;
 
     progress(&format!("new: preparing workspace `{name}`"));
     validate_workspace_name(&name)?;
     let workspace_path = worktrees_dir.join(&name);
     let mut created_workspace = false;
 
-    if workspace_path.is_dir() {
+    if workspace_path.is_dir() && !reserved_name {
         progress(&format!(
             "new: inspecting existing workspace `{}`",
             workspace_path.display()
@@ -347,56 +356,66 @@ fn cmd_new(
         }
     }
 
-    if !workspace_path.exists() {
-        progress("new: creating git worktree");
-        let revision = from_revision.unwrap_or(DEFAULT_WORKSPACE_REVISION).trim();
-        if revision.is_empty() {
-            bail!("--from must not be empty");
-        }
-        if !git_revision_exists(&repo_root, revision) {
-            bail!("revision `{revision}` is not valid or cannot be resolved");
-        }
-        let workspace_branch = workspace_branch_name(&repo_root, &name)?;
-        let workspace_str = path_to_str(&workspace_path)?;
-        let output = if git_branch_exists(&repo_root, &workspace_branch) {
-            if from_revision.is_some() {
-                progress(&format!(
-                    "new: branch `{workspace_branch}` already exists; ignoring `--from {revision}`"
-                ));
+    if reserved_name || !workspace_path.exists() {
+        let create_result = (|| -> Result<()> {
+            progress("new: creating git worktree");
+            let revision = from_revision.unwrap_or(DEFAULT_WORKSPACE_REVISION).trim();
+            if revision.is_empty() {
+                bail!("--from must not be empty");
             }
-            run_capture(
-                "git",
-                &["worktree", "add", workspace_str, &workspace_branch],
-                Some(&repo_root),
-            )?
-        } else {
-            run_capture(
-                "git",
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    &workspace_branch,
-                    workspace_str,
-                    revision,
-                ],
-                Some(&repo_root),
-            )?
-        };
-        if !output.status.success() {
-            let error_line = best_error_line(&output.stderr);
-            if workspace_path.exists() {
+            if !git_revision_exists(&repo_root, revision) {
+                bail!("revision `{revision}` is not valid or cannot be resolved");
+            }
+            let workspace_branch = workspace_branch_name(&repo_root, &name)?;
+            let workspace_str = path_to_str(&workspace_path)?;
+            let output = if git_branch_exists(&repo_root, &workspace_branch) {
+                if from_revision.is_some() {
+                    progress(&format!(
+                        "new: branch `{workspace_branch}` already exists; ignoring `--from {revision}`"
+                    ));
+                }
+                run_capture(
+                    "git",
+                    &["worktree", "add", workspace_str, &workspace_branch],
+                    Some(&repo_root),
+                )?
+            } else {
+                run_capture(
+                    "git",
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        &workspace_branch,
+                        workspace_str,
+                        revision,
+                    ],
+                    Some(&repo_root),
+                )?
+            };
+            if !output.status.success() {
+                let error_line = best_error_line(&output.stderr);
+                if workspace_path.exists() {
+                    remove_workspace_for_recreate(&repo_root, &workspace_path)?;
+                }
+                bail!("failed to create git worktree `{name}`: {error_line}");
+            }
+            created_workspace = true;
+            Ok(())
+        })();
+
+        if let Err(err) = create_result {
+            if reserved_name && workspace_path.exists() {
                 if let Err(cleanup_err) = remove_workspace_for_recreate(&repo_root, &workspace_path)
                 {
                     eprintln!(
-                        "warning: failed to clean workspace after create failure `{}`: {cleanup_err:#}",
+                        "warning: failed to clean reserved workspace `{}` after error: {cleanup_err:#}",
                         workspace_path.display()
                     );
                 }
             }
-            bail!("failed to create git worktree `{name}`: {error_line}");
+            return Err(err);
         }
-        created_workspace = true;
     }
 
     if created_workspace {
@@ -418,30 +437,59 @@ fn resolve_new_workspace_name(
     agent_cmd: &[String],
     repo_root: &Path,
     worktrees_dir: &Path,
-) -> Result<String> {
+) -> Result<ResolvedWorkspaceName> {
     if let Some(name) = explicit_name {
         validate_workspace_name(name)?;
-        return Ok(name.to_string());
+        return Ok(ResolvedWorkspaceName {
+            name: name.to_string(),
+            reserved: false,
+        });
     }
 
     progress("new: generating workspace name via Claude");
     let command = shell_join(agent_cmd);
-    let claude_result = suggest_workspace_name_from_claude(config, &command, repo_root);
-    let mut selected = match claude_result {
-        Ok(Some(name)) => name,
-        Ok(None) => fallback_workspace_name(worktrees_dir),
-        Err(err) => {
-            eprintln!("warning: failed to generate workspace name via Claude: {err}");
-            fallback_workspace_name(worktrees_dir)
-        }
-    };
+    let mut claude_suggestion =
+        match suggest_workspace_name_from_claude(config, &command, repo_root) {
+            Ok(Some(name)) if validate_workspace_name(&name).is_ok() => Some(name),
+            Ok(Some(name)) => {
+                eprintln!("warning: ignoring invalid generated workspace name `{name}`");
+                None
+            }
+            Ok(None) => None,
+            Err(err) => {
+                eprintln!("warning: failed to generate workspace name via Claude: {err}");
+                None
+            }
+        };
+    let mut fallback_attempt = 0u64;
 
-    if validate_workspace_name(&selected).is_err() {
-        selected = fallback_workspace_name(worktrees_dir);
+    for _ in 0..FALLBACK_NAME_MAX_RESERVATION_ATTEMPTS {
+        let candidate = match claude_suggestion.take() {
+            Some(name) => name,
+            None => {
+                let name = fallback_workspace_name_candidate(fallback_attempt);
+                fallback_attempt = fallback_attempt.saturating_add(1);
+                name
+            }
+        };
+
+        if validate_workspace_name(&candidate).is_err() {
+            continue;
+        }
+
+        if reserve_workspace_name(worktrees_dir, &candidate)? {
+            progress(&format!("new: selected workspace name `{candidate}`"));
+            return Ok(ResolvedWorkspaceName {
+                name: candidate,
+                reserved: true,
+            });
+        }
     }
 
-    progress(&format!("new: selected workspace name `{selected}`"));
-    Ok(selected)
+    bail!(
+        "failed to reserve a unique workspace name under {}",
+        worktrees_dir.display()
+    )
 }
 
 fn suggest_workspace_name_from_claude(
@@ -452,6 +500,20 @@ fn suggest_workspace_name_from_claude(
     let prompt = auto_name_prompt(agent_command);
     let output = run_claude_text(config, &prompt, cwd)?;
     Ok(parse_auto_name_response(&output))
+}
+
+fn reserve_workspace_name(worktrees_dir: &Path, name: &str) -> Result<bool> {
+    let workspace_path = worktrees_dir.join(name);
+    match fs::create_dir(&workspace_path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to reserve workspace name `{name}` at {}",
+                workspace_path.display()
+            )
+        }),
+    }
 }
 
 fn remove_workspace_for_recreate(repo_root: &Path, workspace_path: &Path) -> Result<()> {
@@ -1792,6 +1854,15 @@ mod tests {
         let dirs = list_workspace_dirs(root).expect("list dirs");
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0].0, "alpha");
+    }
+
+    #[test]
+    fn test_reserve_workspace_name_is_atomic_for_existing_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir_all(root).expect("mkdir root");
+        assert!(reserve_workspace_name(root, "alpha").expect("reserve first"));
+        assert!(!reserve_workspace_name(root, "alpha").expect("reserve second"));
     }
 
     #[test]

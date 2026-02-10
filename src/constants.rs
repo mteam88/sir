@@ -1,10 +1,9 @@
 pub(crate) const DEFAULT_SHELL: &str = "sh";
-pub(crate) const DEFAULT_WORKSPACE_REVISION: &str = "HEAD";
 
-pub(crate) const FALLBACK_NAME_ATTEMPTS: u64 = 100;
+pub(crate) const DEFAULT_WORKSPACE_REVISION: &str = "HEAD";
+pub(crate) const FALLBACK_NAME_MAX_RESERVATION_ATTEMPTS: u64 = 256;
 pub(crate) const FALLBACK_NAME_SUFFIX_OFFSET: u64 = 97;
 pub(crate) const FALLBACK_NAME_SUFFIX_START: u64 = 2;
-pub(crate) const FALLBACK_NAME_DEFAULT: &str = "pink elephant";
 
 pub(crate) const PSEUDO_RANDOM_MIX_A: u64 = 0x9E37_79B9_7F4A_7C15;
 pub(crate) const PSEUDO_RANDOM_MIX_B: u64 = 0xFF51_AFD7_ED55_8CCD;

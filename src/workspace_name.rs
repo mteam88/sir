@@ -1,8 +1,7 @@
 use crate::constants::{
-    FALLBACK_NAME_ATTEMPTS, FALLBACK_NAME_DEFAULT, FALLBACK_NAME_SUFFIX_OFFSET,
-    FALLBACK_NAME_SUFFIX_START, PSEUDO_RANDOM_MIX_A, PSEUDO_RANDOM_MIX_B,
+    FALLBACK_NAME_SUFFIX_OFFSET, FALLBACK_NAME_SUFFIX_START, PSEUDO_RANDOM_MIX_A,
+    PSEUDO_RANDOM_MIX_B,
 };
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ADJECTIVES: &[&str] = &[
@@ -14,21 +13,14 @@ const NOUNS: &[&str] = &[
     "comet", "panther", "sailor",
 ];
 
-pub(crate) fn fallback_workspace_name(worktrees_dir: &Path) -> String {
-    for attempt in 0..FALLBACK_NAME_ATTEMPTS {
-        let adjective = ADJECTIVES[pseudo_random_index(ADJECTIVES.len(), attempt)];
-        let noun = NOUNS[pseudo_random_index(NOUNS.len(), attempt + FALLBACK_NAME_SUFFIX_OFFSET)];
-        let base = format!("{adjective} {noun}");
-        if !worktrees_dir.join(&base).exists() {
-            return base;
-        }
-        let with_suffix = format!("{base} {}", attempt + FALLBACK_NAME_SUFFIX_START);
-        if !worktrees_dir.join(&with_suffix).exists() {
-            return with_suffix;
-        }
+pub(crate) fn fallback_workspace_name_candidate(attempt: u64) -> String {
+    let adjective = ADJECTIVES[pseudo_random_index(ADJECTIVES.len(), attempt)];
+    let noun = NOUNS[pseudo_random_index(NOUNS.len(), attempt + FALLBACK_NAME_SUFFIX_OFFSET)];
+    let base = format!("{adjective} {noun}");
+    if attempt == 0 {
+        return base;
     }
-
-    FALLBACK_NAME_DEFAULT.to_string()
+    format!("{base} {}", attempt + FALLBACK_NAME_SUFFIX_START)
 }
 
 fn pseudo_random_index(len: usize, salt: u64) -> usize {
