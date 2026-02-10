@@ -8,6 +8,7 @@ This document is a compact implementation plan/spec for the `sir` CLI.
 - Creates/opens isolated workspaces under `repo/.worktrees/<name>/`.
 - Uses `git worktree` as the backend.
 - Uses Claude CLI for initialization copy and settle/merge, with Claude allowed to run commands via `--dangerously-skip-permissions`.
+- Uses Claude model `sonnet` by default for internal Claude tasks.
 
 ### What `sir` does not do
 - No zellij/session management.
@@ -32,10 +33,12 @@ Minimal fields:
 
 ```toml
 claude_bin = "claude"
+claude_model = "sonnet"
 ```
 
 Defaults if missing:
 - `claude_bin = "claude"`
+- `claude_model = "sonnet"`
 
 ## 3) CLI commands
 
@@ -85,6 +88,7 @@ Behavior:
 1. Resolve repo root.
 2. Resolve workspace path from `<name>` or current cwd.
 3. Run Claude in workspace with `--dangerously-skip-permissions`.
+   - pass `--model sonnet` by default (configurable)
 4. Prompt Claude to:
    - inspect with git status/diff/log
    - produce clean commit(s) and strong messages

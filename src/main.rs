@@ -67,17 +67,20 @@ enum Commands {
 #[derive(Debug, Deserialize, Default)]
 struct PartialConfig {
     claude_bin: Option<String>,
+    claude_model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct Config {
     claude_bin: String,
+    claude_model: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             claude_bin: "claude".to_string(),
+            claude_model: "sonnet".to_string(),
         }
     }
 }
@@ -97,6 +100,11 @@ impl Config {
                 && !claude_bin.trim().is_empty()
             {
                 config.claude_bin = claude_bin;
+            }
+            if let Some(claude_model) = parsed.claude_model
+                && !claude_model.trim().is_empty()
+            {
+                config.claude_model = claude_model;
             }
             break;
         }
@@ -319,7 +327,7 @@ fn cmd_new(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
 
     progress("new: running initialization via Claude");
     let init_prompt = new_init_prompt(&workspace_path);
-    run_claude(&config.claude_bin, &init_prompt, &repo_root)?;
+    run_claude(config, &init_prompt, &repo_root)?;
 
     progress("new: launching agent command");
     run_agent_command(agent_cmd, &workspace_path)
@@ -446,7 +454,7 @@ fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
 
     progress("settle: running integration via Claude");
     let settle_prompt = settle_prompt(&name, &workspace_path);
-    run_claude(&config.claude_bin, &settle_prompt, &workspace_path)?;
+    run_claude(config, &settle_prompt, &workspace_path)?;
 
     progress("settle: running post-checks");
     println!("\nPost-check:");
@@ -562,14 +570,23 @@ fn settle_prompt(name: &str, workspace_path: &Path) -> String {
     )
 }
 
-fn run_claude(claude_bin: &str, prompt: &str, cwd: &Path) -> Result<()> {
-    let args = ensure_claude_streaming_args(&[
+fn run_claude(config: &Config, prompt: &str, cwd: &Path) -> Result<()> {
+    let args = build_claude_args(prompt, &config.claude_model);
+    run_claude_stream(&config.claude_bin, &args, Some(cwd))
+        .with_context(|| format!("failed while running `{}`", config.claude_bin))
+}
+
+fn build_claude_args(prompt: &str, model: &str) -> Vec<String> {
+    let mut args = vec![
         "-p".to_string(),
         prompt.to_string(),
         "--dangerously-skip-permissions".to_string(),
-    ]);
-    run_claude_stream(claude_bin, &args, Some(cwd))
-        .with_context(|| format!("failed while running `{claude_bin}`"))
+    ];
+    if !model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(model.trim().to_string());
+    }
+    ensure_claude_streaming_args(&args)
 }
 
 fn progress(message: &str) {
@@ -1350,6 +1367,22 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "--include-partial-messages")
         );
+    }
+
+    #[test]
+    fn test_build_claude_args_includes_model() {
+        let args = build_claude_args("hello", "sonnet");
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        assert!(args.windows(2).any(|win| win == ["--model", "sonnet"]));
+    }
+
+    #[test]
+    fn test_build_claude_args_omits_blank_model() {
+        let args = build_claude_args("hello", "   ");
+        assert!(!args.iter().any(|arg| arg == "--model"));
     }
 
     #[test]

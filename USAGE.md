@@ -7,6 +7,7 @@ This file documents the standard day-to-day workflow for `sir`.
 - `git` installed
 - Claude CLI installed (`claude`)
 - Run commands from a git repository root
+- `sir` uses Claude model `sonnet` by default for `new` init and `settle` (override via `claude_model` in config)
 
 ## Standard Workflow
 

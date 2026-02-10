@@ -7,6 +7,7 @@ Minimal workspace wrapper for `git worktree` + Claude CLI in a raw terminal work
 - Creates isolated workspaces under `repo/.worktrees/<name>/`
 - Uses `git worktree` as the only backend
 - Delegates initialization copy and settle/integration to Claude CLI with `--dangerously-skip-permissions`
+- Uses Claude model `sonnet` by default for internal Claude tasks (`new` init + `settle`)
 - Enables Claude streaming output (`stream-json` + partial messages) and renders text deltas live
 - Runs agent commands directly in your current terminal
 
@@ -46,12 +47,14 @@ Defaults:
 
 ```toml
 claude_bin = "claude"
+claude_model = "sonnet"
 ```
 
 Example:
 
 ```toml
 claude_bin = "claude"
+claude_model = "sonnet"
 ```
 
 ## Commands
@@ -89,6 +92,7 @@ Behavior:
   - `target/` (if present)
   - `node_modules/` (if present)
   - no symlinks
+  - uses `--model sonnet` by default (configurable via `claude_model`)
 - Runs `<agent_cmd...>` through `/bin/zsh` with cwd set to the workspace
 - After the agent command exits, leaves you in an interactive `/bin/zsh` in that workspace
 
@@ -154,6 +158,7 @@ Behavior:
   - provided name: `repo/.worktrees/<name>`
   - omitted name: inferred from current directory when inside `.worktrees/<name>`
 - Runs Claude in workspace with `--dangerously-skip-permissions`
+- Uses `--model sonnet` by default (configurable via `claude_model`)
 - Prompt instructs Claude to:
   - inspect status/diff/log with git
   - produce clean commit(s) and strong commit messages
