@@ -7,6 +7,7 @@ Minimal workspace wrapper for `git worktree` + Claude CLI in a raw terminal work
 - Creates isolated workspaces under `repo/.worktrees/<name>/`
 - Uses `git worktree` as the only backend
 - Delegates initialization copy and settle/integration to Claude CLI with `--dangerously-skip-permissions`
+- Enables Claude streaming output (`stream-json` + partial messages) and renders text deltas live
 - Runs agent commands directly in your current terminal
 
 ## Requirements
@@ -88,7 +89,8 @@ Behavior:
   - `target/` (if present)
   - `node_modules/` (if present)
   - no symlinks
-- Runs `<agent_cmd...>` with cwd set to the workspace
+- Runs `<agent_cmd...>` through `/bin/zsh` with cwd set to the workspace
+- After the agent command exits, leaves you in an interactive `/bin/zsh` in that workspace
 
 Examples:
 

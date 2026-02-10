@@ -32,7 +32,8 @@ What this does:
 - Creates/uses `.worktrees/<name>`
 - Creates/uses branch `sir/<name>`
 - Seeds new workspace with current uncommitted changes from the source repo
-- Runs your agent command in that workspace
+- Runs your agent command in that workspace through `/bin/zsh`
+- Leaves you in a workspace `/bin/zsh` prompt after the agent command exits
 
 3. Do your implementation work in the workspace:
 

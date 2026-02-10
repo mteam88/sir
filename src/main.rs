@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -429,10 +429,44 @@ fn run_agent_command(agent_cmd: &[String], workspace_path: &Path) -> Result<()> 
         agent_cmd.join(" ")
     );
 
-    let program = &agent_cmd[0];
-    let args: Vec<&str> = agent_cmd.iter().skip(1).map(String::as_str).collect();
-    run_stream(program, &args, Some(workspace_path))
-        .with_context(|| format!("failed to run agent command `{}`", program))
+    run_agent_command_with_shell(agent_cmd, workspace_path)
+}
+
+fn run_agent_command_with_shell(agent_cmd: &[String], workspace_path: &Path) -> Result<()> {
+    let zsh = "/bin/zsh";
+    if !Path::new(zsh).exists() {
+        bail!("spawn requires `{zsh}` to exist");
+    }
+
+    let command = shell_join(agent_cmd);
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return run_stream(zsh, &["-c", &command], Some(workspace_path))
+            .context("failed to run agent command inside /bin/zsh");
+    }
+
+    let script = format!("{command};\necho;\nexec {zsh} -i");
+    run_stream(zsh, &["-i", "-c", &script], Some(workspace_path))
+        .context("failed to run agent command inside zsh")
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "@%_+=:,./-".contains(ch))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn run_workspace_shell(workspace_path: &Path) -> Result<()> {
@@ -485,8 +519,12 @@ fn settle_prompt(name: &str, workspace_path: &Path) -> String {
 }
 
 fn run_claude(claude_bin: &str, prompt: &str, cwd: &Path) -> Result<()> {
-    let args = ["-p", prompt, "--dangerously-skip-permissions"];
-    run_stream(claude_bin, &args, Some(cwd))
+    let args = ensure_claude_streaming_args(&[
+        "-p".to_string(),
+        prompt.to_string(),
+        "--dangerously-skip-permissions".to_string(),
+    ]);
+    run_claude_stream(claude_bin, &args, Some(cwd))
         .with_context(|| format!("failed while running `{claude_bin}`"))
 }
 
@@ -961,6 +999,139 @@ fn run_stream(program: &str, args: &[&str], cwd: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+fn run_claude_stream(program: &str, args: &[String], cwd: Option<&Path>) -> Result<()> {
+    let mut command = Command::new(program);
+    command.args(args.iter().map(String::as_str));
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    command.stdin(Stdio::inherit());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::inherit());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run `{program}`"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .with_context(|| format!("failed to capture stdout for `{program}`"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let mut saw_text_delta = false;
+    let mut ended_with_newline = true;
+
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("failed to read stdout from `{program}`"))?;
+        if read == 0 {
+            break;
+        }
+        match parse_claude_stream_line(&line) {
+            ClaudeStreamLine::TextDelta(delta) => {
+                print!("{delta}");
+                std::io::stdout()
+                    .flush()
+                    .context("failed to flush stdout")?;
+                saw_text_delta = true;
+                ended_with_newline = delta.ends_with('\n');
+            }
+            ClaudeStreamLine::Error(message) => {
+                eprintln!("error: {message}");
+            }
+            ClaudeStreamLine::OtherJson => {}
+            ClaudeStreamLine::NonJson(chunk) => {
+                print!("{chunk}");
+                std::io::stdout()
+                    .flush()
+                    .context("failed to flush stdout")?;
+                ended_with_newline = chunk.ends_with('\n');
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed to wait for `{program}`"))?;
+    if saw_text_delta && !ended_with_newline {
+        println!();
+    }
+    if !status.success() {
+        bail!("`{program}` exited with status {status}");
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeStreamLine {
+    TextDelta(String),
+    Error(String),
+    OtherJson,
+    NonJson(String),
+}
+
+fn parse_claude_stream_line(line: &str) -> ClaudeStreamLine {
+    let parsed = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(value) => value,
+        Err(_) => return ClaudeStreamLine::NonJson(line.to_string()),
+    };
+
+    if parsed.get("type").and_then(serde_json::Value::as_str) == Some("stream_event")
+        && parsed
+            .pointer("/event/delta/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("text_delta")
+        && let Some(text) = parsed
+            .pointer("/event/delta/text")
+            .and_then(serde_json::Value::as_str)
+    {
+        return ClaudeStreamLine::TextDelta(text.to_string());
+    }
+
+    if parsed.get("type").and_then(serde_json::Value::as_str) == Some("error") {
+        let message = parsed
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| parsed.get("message").and_then(serde_json::Value::as_str))
+            .unwrap_or("unknown Claude stream error");
+        return ClaudeStreamLine::Error(message.to_string());
+    }
+
+    ClaudeStreamLine::OtherJson
+}
+
+fn ensure_claude_streaming_args(args: &[String]) -> Vec<String> {
+    let mut with_streaming = args.to_vec();
+    if claude_output_format(args).is_none() {
+        with_streaming.push("--output-format".to_string());
+        with_streaming.push("stream-json".to_string());
+    }
+    if !args.iter().any(|arg| arg == "--verbose" || arg == "-v") {
+        with_streaming.push("--verbose".to_string());
+    }
+    if !args.iter().any(|arg| arg == "--include-partial-messages") {
+        with_streaming.push("--include-partial-messages".to_string());
+    }
+    with_streaming
+}
+
+fn claude_output_format(args: &[String]) -> Option<String> {
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if let Some(value) = arg.strip_prefix("--output-format=") {
+            return Some(value.to_string());
+        }
+        if arg == "--output-format" {
+            return args.get(idx + 1).cloned().or_else(|| Some(String::new()));
+        }
+        idx += 1;
+    }
+    None
+}
+
 fn first_line(value: &str) -> String {
     value
         .lines()
@@ -1047,5 +1218,78 @@ mod tests {
             inferred.1.canonicalize().expect("canonical inferred path"),
             expected
         );
+    }
+
+    #[test]
+    fn test_parse_claude_stream_line_text_delta() {
+        let line =
+            r#"{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"hello"}}}"#;
+        assert_eq!(
+            parse_claude_stream_line(line),
+            ClaudeStreamLine::TextDelta("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_claude_stream_line_non_json() {
+        let line = "plain output\n";
+        assert_eq!(
+            parse_claude_stream_line(line),
+            ClaudeStreamLine::NonJson("plain output\n".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ensure_claude_streaming_args_adds_defaults() {
+        let args = vec!["-p".to_string(), "hello".to_string()];
+        let augmented = ensure_claude_streaming_args(&args);
+        assert!(augmented.iter().any(|arg| arg == "--verbose"));
+        assert!(
+            augmented
+                .iter()
+                .any(|arg| arg == "--include-partial-messages")
+        );
+        assert_eq!(
+            claude_output_format(&augmented),
+            Some("stream-json".to_string())
+        );
+    }
+
+    #[test]
+    fn test_ensure_claude_streaming_args_respects_existing_output_format() {
+        let args = vec![
+            "-p".to_string(),
+            "hello".to_string(),
+            "--output-format".to_string(),
+            "text".to_string(),
+            "--verbose".to_string(),
+        ];
+        let augmented = ensure_claude_streaming_args(&args);
+        assert_eq!(claude_output_format(&augmented), Some("text".to_string()));
+        assert!(
+            augmented
+                .iter()
+                .any(|arg| arg == "--include-partial-messages")
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_safe_chars_unchanged() {
+        assert_eq!(shell_quote("abc-123_/."), "abc-123_/.");
+    }
+
+    #[test]
+    fn test_shell_quote_escapes_single_quote() {
+        assert_eq!(shell_quote("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn test_shell_join_quotes_complex_args() {
+        let args = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "hello world".to_string(),
+        ];
+        assert_eq!(shell_join(&args), "claude -p 'hello world'");
     }
 }
