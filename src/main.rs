@@ -2,7 +2,7 @@ mod constants;
 mod shell;
 mod workspace_name;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -88,7 +88,7 @@ enum Commands {
     Open { name: String },
     /// Remove a workspace by name, or remove all clean workspaces.
     Rm {
-        /// Workspace name. Omit when using `--all-clean`.
+        /// Workspace name or status index. Omit when using `--all-clean`.
         name: Option<String>,
         /// Remove all workspaces that have no unstaged or untracked changes.
         #[arg(long)]
@@ -686,56 +686,28 @@ fn cmd_rm(name: Option<&str>, all_clean: bool) -> Result<()> {
         return cmd_rm_all_clean();
     }
 
-    let name = name.context("workspace name is required unless --all-clean is set")?;
-    cmd_rm_single(name)
+    let target = name.context("workspace name is required unless --all-clean is set")?;
+    cmd_rm_single(target)
 }
 
-fn cmd_rm_single(name: &str) -> Result<()> {
-    progress(&format!("rm: resolving workspace `{name}`"));
-    validate_workspace_name(name)?;
-    let repo_root = repo_root()?;
-    let workspace_path = repo_root.join(".worktrees").join(name);
-    if !workspace_path.exists() {
-        bail!("workspace does not exist: {}", workspace_path.display());
-    }
-    if !workspace_path.is_dir() {
-        bail!(
-            "workspace path is not a directory: {}",
-            workspace_path.display()
-        );
-    }
-
-    let workspace_str = path_to_str(&workspace_path)?;
-    let output = run_capture(
-        "git",
-        &["worktree", "remove", "--force", workspace_str],
-        Some(&repo_root),
-    )?;
-    if output.status.success() {
-        progress(&format!("rm: removed workspace `{name}`"));
-        return Ok(());
-    }
-
-    if detect_workspace_backend(&workspace_path) == WorkspaceBackend::Unknown {
-        fs::remove_dir_all(&workspace_path)
-            .with_context(|| format!("failed to remove {}", workspace_path.display()))?;
-        progress(&format!("rm: removed non-git workspace `{name}`"));
-        return Ok(());
-    }
-
-    bail!(
-        "failed to remove git worktree `{name}`: {}",
-        best_error_line(&output.stderr)
-    );
+fn cmd_rm_single(target: &str) -> Result<()> {
+    progress(&format!("rm: resolving workspace target `{target}`"));
+    let repo_root = repo_common_root()?;
+    let records = discover_workspaces(&repo_root)?;
+    let resolved = resolve_workspace_for_rm(&records, target)?;
+    remove_workspace_record(&repo_root, resolved.index, &resolved.record)
 }
 
 fn cmd_rm_all_clean() -> Result<()> {
     progress("rm: scanning for clean workspaces");
-    let repo_root = repo_root()?;
+    let repo_root = repo_common_root()?;
+    let records = discover_workspaces(&repo_root)?;
     let worktrees_dir = repo_root.join(".worktrees");
-    let entries = list_workspace_dirs(&worktrees_dir)?;
-    if entries.is_empty() {
-        println!("No workspaces found under {}", worktrees_dir.display());
+    if records.is_empty() {
+        println!(
+            "No workspaces found under {} or linked via git worktree",
+            worktrees_dir.display()
+        );
         return Ok(());
     }
 
@@ -744,25 +716,29 @@ fn cmd_rm_all_clean() -> Result<()> {
     let mut skipped_non_git = 0usize;
     let mut failures = Vec::new();
 
-    for (name, path) in entries {
-        if detect_workspace_backend(&path) != WorkspaceBackend::Git {
+    for (offset, record) in records.iter().enumerate() {
+        let index = offset + 1;
+        if record.backend != WorkspaceBackend::Git {
             skipped_non_git += 1;
             continue;
         }
 
-        match workspace_has_unstaged_changes(&path) {
+        match workspace_has_unstaged_changes(&record.path) {
             Ok(true) => {
                 skipped_dirty += 1;
             }
             Ok(false) => {
-                progress(&format!("rm: removing clean workspace `{name}`"));
-                if let Err(err) = cmd_rm_single(&name) {
-                    failures.push(format!("{name}: {err:#}"));
+                progress(&format!(
+                    "rm: removing clean workspace [{}] `{}`",
+                    index, record.name
+                ));
+                if let Err(err) = remove_workspace_record(&repo_root, index, record) {
+                    failures.push(format!("{} [{}]: {err:#}", record.name, index));
                 } else {
                     removed += 1;
                 }
             }
-            Err(err) => failures.push(format!("{name}: {err:#}")),
+            Err(err) => failures.push(format!("{} [{}]: {err:#}", record.name, index)),
         }
     }
 
@@ -784,48 +760,29 @@ fn cmd_status(as_json: bool) -> Result<()> {
     progress("status: scanning workspaces");
     let repo_root = repo_common_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
-    let entries = list_workspace_dirs(&worktrees_dir)?;
-
-    let mut rows = Vec::new();
-    let mut seen_paths = Vec::new();
-    for (name, path) in entries {
-        let backend = detect_workspace_backend(&path);
-        let summary = workspace_status_summary(backend, &path);
-        rows.push(StatusRow {
-            name,
-            path: path.clone(),
-            backend: backend.to_string(),
-            summary,
-        });
-        seen_paths.push(path);
-    }
-
-    let linked_entries = list_external_git_workspaces(&repo_root, &worktrees_dir)?;
-    for linked in linked_entries {
-        if seen_paths
-            .iter()
-            .any(|existing| paths_equal(existing, &linked.path))
-        {
-            continue;
-        }
-        let backend = detect_workspace_backend(&linked.path);
-        let summary = workspace_status_summary(backend, &linked.path);
-        rows.push(StatusRow {
-            name: linked.name,
-            path: linked.path.clone(),
-            backend: backend.to_string(),
-            summary,
-        });
-        seen_paths.push(linked.path);
-    }
+    let records = discover_workspaces(&repo_root)?;
+    let rows: Vec<StatusRow> = records
+        .into_iter()
+        .enumerate()
+        .map(|(offset, record)| StatusRow {
+            index: offset + 1,
+            name: record.name,
+            path: record.path.clone(),
+            backend: record.backend,
+            source: record.source,
+            summary: workspace_status_summary(record.backend, &record.path),
+        })
+        .collect();
 
     if as_json {
         let json_rows: Vec<JsonStatusRow> = rows
             .iter()
             .map(|row| JsonStatusRow {
+                index: row.index,
                 name: row.name.clone(),
                 path: row.path.display().to_string(),
-                backend: row.backend.clone(),
+                backend: row.backend.to_string(),
+                source: row.source.to_string(),
                 summary: row.summary.clone(),
             })
             .collect();
@@ -841,12 +798,17 @@ fn cmd_status(as_json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<24} {:<8} STATUS", "NAME", "BACKEND");
+    println!(
+        "{:<4} {:<24} {:<8} {:<8} STATUS",
+        "IDX", "NAME", "BACKEND", "SOURCE"
+    );
     for row in rows {
         println!(
-            "{:<24} {:<8} {}",
+            "{:<4} {:<24} {:<8} {:<8} {}",
+            row.index,
             row.name,
             row.backend,
+            row.source,
             truncate(&row.summary, STATUS_TRUNCATE_MAX_CHARS)
         );
     }
@@ -858,6 +820,187 @@ fn cmd_status(as_json: bool) -> Result<()> {
 struct LinkedWorkspaceEntry {
     name: String,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSource {
+    Local,
+    Linked,
+}
+
+impl std::fmt::Display for WorkspaceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => write!(f, "local"),
+            Self::Linked => write!(f, "linked"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceRecord {
+    name: String,
+    path: PathBuf,
+    backend: WorkspaceBackend,
+    source: WorkspaceSource,
+}
+
+#[derive(Debug, Clone)]
+struct IndexedWorkspaceRecord {
+    index: usize,
+    record: WorkspaceRecord,
+}
+
+fn discover_workspaces(repo_root: &Path) -> Result<Vec<WorkspaceRecord>> {
+    let worktrees_dir = repo_root.join(".worktrees");
+    let mut records = Vec::new();
+    let mut seen_paths = Vec::new();
+
+    for (name, path) in list_workspace_dirs(&worktrees_dir)? {
+        let backend = detect_workspace_backend(&path);
+        records.push(WorkspaceRecord {
+            name,
+            path: path.clone(),
+            backend,
+            source: WorkspaceSource::Local,
+        });
+        seen_paths.push(path);
+    }
+
+    let mut linked_entries = list_external_git_workspaces(repo_root, &worktrees_dir)?;
+    linked_entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    for linked in linked_entries {
+        if seen_paths
+            .iter()
+            .any(|existing| paths_equal(existing, &linked.path))
+        {
+            continue;
+        }
+        let backend = detect_workspace_backend(&linked.path);
+        records.push(WorkspaceRecord {
+            name: linked.name,
+            path: linked.path.clone(),
+            backend,
+            source: WorkspaceSource::Linked,
+        });
+        seen_paths.push(linked.path);
+    }
+
+    Ok(records)
+}
+
+fn parse_workspace_index(value: &str) -> Option<usize> {
+    let candidate = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    let parsed = candidate.parse::<usize>().ok()?;
+    if parsed == 0 {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn resolve_workspace_for_rm(
+    records: &[WorkspaceRecord],
+    target: &str,
+) -> Result<IndexedWorkspaceRecord> {
+    if let Some(index) = parse_workspace_index(target)
+        && let Some(record) = records.get(index.saturating_sub(1))
+    {
+        return Ok(IndexedWorkspaceRecord {
+            index,
+            record: record.clone(),
+        });
+    }
+
+    let mut matches = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.name == target)
+        .collect::<Vec<_>>();
+
+    match matches.len() {
+        1 => {
+            let (offset, record) = matches.remove(0);
+            Ok(IndexedWorkspaceRecord {
+                index: offset + 1,
+                record: record.clone(),
+            })
+        }
+        0 => bail!("workspace target `{target}` was not found; run `sir status` to see indexes"),
+        _ => {
+            eprintln!("workspace target `{target}` is ambiguous; use an index from `sir status`:");
+            for (offset, record) in matches {
+                eprintln!(
+                    "- [{}] {} ({})",
+                    offset + 1,
+                    record.name,
+                    record.path.display()
+                );
+            }
+            bail!("workspace target `{target}` matches multiple workspaces");
+        }
+    }
+}
+
+fn remove_workspace_record(repo_root: &Path, index: usize, record: &WorkspaceRecord) -> Result<()> {
+    progress(&format!(
+        "rm: removing workspace [{}] `{}` at {}",
+        index,
+        record.name,
+        record.path.display()
+    ));
+    if !record.path.exists() {
+        bail!("workspace path does not exist: {}", record.path.display());
+    }
+    if !record.path.is_dir() {
+        bail!(
+            "workspace path is not a directory: {}",
+            record.path.display()
+        );
+    }
+
+    match record.backend {
+        WorkspaceBackend::Git => {
+            let workspace_str = path_to_str(&record.path)?;
+            let output = run_capture(
+                "git",
+                &["worktree", "remove", "--force", workspace_str],
+                Some(repo_root),
+            )?;
+            if output.status.success() {
+                progress(&format!(
+                    "rm: removed workspace [{}] `{}`",
+                    index, record.name
+                ));
+                return Ok(());
+            }
+
+            if detect_workspace_backend(&record.path) == WorkspaceBackend::Unknown {
+                fs::remove_dir_all(&record.path)
+                    .with_context(|| format!("failed to remove {}", record.path.display()))?;
+                progress(&format!(
+                    "rm: removed non-git workspace [{}] `{}`",
+                    index, record.name
+                ));
+                return Ok(());
+            }
+
+            bail!(
+                "failed to remove git worktree [{}] `{}`: {}",
+                index,
+                record.name,
+                best_error_line(&output.stderr)
+            );
+        }
+        WorkspaceBackend::Unknown => {
+            fs::remove_dir_all(&record.path)
+                .with_context(|| format!("failed to remove {}", record.path.display()))?;
+            progress(&format!(
+                "rm: removed non-git workspace [{}] `{}`",
+                index, record.name
+            ));
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1332,17 +1475,21 @@ impl Check {
 
 #[derive(Debug)]
 struct StatusRow {
+    index: usize,
     name: String,
     path: PathBuf,
-    backend: String,
+    backend: WorkspaceBackend,
+    source: WorkspaceSource,
     summary: String,
 }
 
 #[derive(Debug, Serialize)]
 struct JsonStatusRow {
+    index: usize,
     name: String,
     path: String,
     backend: String,
+    source: String,
     summary: String,
 }
 
@@ -2282,9 +2429,11 @@ detached
         let args = vec!["-p".to_string(), "hello".to_string()];
         let augmented = ensure_claude_streaming_args(&args);
         assert!(augmented.iter().any(|arg| arg == "--verbose"));
-        assert!(augmented
-            .iter()
-            .any(|arg| arg == "--include-partial-messages"));
+        assert!(
+            augmented
+                .iter()
+                .any(|arg| arg == "--include-partial-messages")
+        );
         assert_eq!(
             claude_output_format(&augmented),
             Some("stream-json".to_string())
@@ -2302,17 +2451,20 @@ detached
         ];
         let augmented = ensure_claude_streaming_args(&args);
         assert_eq!(claude_output_format(&augmented), Some("text".to_string()));
-        assert!(augmented
-            .iter()
-            .any(|arg| arg == "--include-partial-messages"));
+        assert!(
+            augmented
+                .iter()
+                .any(|arg| arg == "--include-partial-messages")
+        );
     }
 
     #[test]
     fn test_build_claude_args_includes_model() {
         let args = build_claude_args("hello", "sonnet");
-        assert!(args
-            .iter()
-            .any(|arg| arg == "--dangerously-skip-permissions"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
         assert!(args.windows(2).any(|win| win == ["--model", "sonnet"]));
     }
 
@@ -2409,17 +2561,93 @@ detached
     #[test]
     fn test_cmd_rm_requires_name_without_all_clean() {
         let err = cmd_rm(None, false).expect_err("expected missing name error");
-        assert!(err
-            .to_string()
-            .contains("workspace name is required unless --all-clean is set"));
+        assert!(
+            err.to_string()
+                .contains("workspace name is required unless --all-clean is set")
+        );
     }
 
     #[test]
     fn test_cmd_rm_rejects_name_with_all_clean() {
         let err = cmd_rm(Some("foo"), true).expect_err("expected invalid arg combination");
-        assert!(err
-            .to_string()
-            .contains("cannot pass <name> with --all-clean"));
+        assert!(
+            err.to_string()
+                .contains("cannot pass <name> with --all-clean")
+        );
+    }
+
+    #[test]
+    fn test_parse_workspace_index() {
+        assert_eq!(parse_workspace_index("1"), Some(1));
+        assert_eq!(parse_workspace_index("#2"), Some(2));
+        assert_eq!(parse_workspace_index("0"), None);
+        assert_eq!(parse_workspace_index("abc"), None);
+    }
+
+    #[test]
+    fn test_resolve_workspace_for_rm_by_index() {
+        let records = vec![
+            WorkspaceRecord {
+                name: "alpha".to_string(),
+                path: PathBuf::from("/tmp/alpha"),
+                backend: WorkspaceBackend::Git,
+                source: WorkspaceSource::Local,
+            },
+            WorkspaceRecord {
+                name: "codex/one".to_string(),
+                path: PathBuf::from("/tmp/codex/one"),
+                backend: WorkspaceBackend::Git,
+                source: WorkspaceSource::Linked,
+            },
+        ];
+
+        let resolved = resolve_workspace_for_rm(&records, "2").expect("resolve by index");
+        assert_eq!(resolved.index, 2);
+        assert_eq!(resolved.record.name, "codex/one");
+        assert_eq!(resolved.record.source, WorkspaceSource::Linked);
+    }
+
+    #[test]
+    fn test_resolve_workspace_for_rm_by_name() {
+        let records = vec![
+            WorkspaceRecord {
+                name: "alpha".to_string(),
+                path: PathBuf::from("/tmp/alpha"),
+                backend: WorkspaceBackend::Git,
+                source: WorkspaceSource::Local,
+            },
+            WorkspaceRecord {
+                name: "codex/one".to_string(),
+                path: PathBuf::from("/tmp/codex/one"),
+                backend: WorkspaceBackend::Git,
+                source: WorkspaceSource::Linked,
+            },
+        ];
+
+        let resolved = resolve_workspace_for_rm(&records, "codex/one").expect("resolve by name");
+        assert_eq!(resolved.index, 2);
+        assert_eq!(resolved.record.path, PathBuf::from("/tmp/codex/one"));
+    }
+
+    #[test]
+    fn test_resolve_workspace_for_rm_rejects_ambiguous_name() {
+        let records = vec![
+            WorkspaceRecord {
+                name: "same".to_string(),
+                path: PathBuf::from("/tmp/one"),
+                backend: WorkspaceBackend::Git,
+                source: WorkspaceSource::Local,
+            },
+            WorkspaceRecord {
+                name: "same".to_string(),
+                path: PathBuf::from("/tmp/two"),
+                backend: WorkspaceBackend::Git,
+                source: WorkspaceSource::Linked,
+            },
+        ];
+
+        let err = resolve_workspace_for_rm(&records, "same").expect_err("ambiguous");
+        assert!(err.to_string().contains("matches multiple workspaces"));
     }
 
     #[test]

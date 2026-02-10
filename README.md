@@ -119,8 +119,10 @@ Workspace listing from `.worktrees/` (excluding `_logs`, `_tmp`) plus any other 
 
 For each workspace, prints:
 
+- short index (`IDX`) for fast targeting
 - name
 - backend detection (`git` or `unknown`)
+- source (`local` or `linked`)
 - status summary (`git status -sb`)
 
 Examples:
@@ -142,18 +144,19 @@ Example:
 sir open foo
 ```
 
-### `sir rm [<name>] [--all-clean]`
+### `sir rm [<name-or-index>] [--all-clean]`
 
-Removes workspace `<name>`, or removes all clean workspaces with `--all-clean`.
+Removes workspace by `<name-or-index>`, or removes all clean workspaces with `--all-clean`.
 
 Behavior:
 
-- `sir rm <name>`:
-  - resolves `repo/.worktrees/<name>`
+- `sir rm <name-or-index>`:
+  - resolves target from `sir status` rows (local + linked external worktrees)
+  - supports either workspace name or `IDX`
   - removes git-backed workspaces with `git worktree remove --force`
   - if the workspace is non-git leftovers, deletes the directory directly
 - `sir rm --all-clean`:
-  - scans all directories under `repo/.worktrees/` (excluding reserved dirs)
+  - scans all discovered workspaces from `sir status` (local + linked)
   - for git-backed workspaces, checks `git status --porcelain`
   - removes only workspaces with no unstaged/untracked changes
   - skips dirty workspaces (including untracked files)
@@ -163,6 +166,7 @@ Example:
 
 ```bash
 sir rm foo
+sir rm 2
 sir rm --all-clean
 ```
 

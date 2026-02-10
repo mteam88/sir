@@ -63,6 +63,7 @@ sir status
 ```
 
 `sir status` includes both `repo/.worktrees/*` and other linked git worktrees for the same repo (such as external Codex worktrees).
+Each row includes a short `IDX` value you can pass to `sir rm`.
 
 JSON output:
 
@@ -79,7 +80,9 @@ sir open <name>
 6. Remove a workspace when you are done with it:
 
 ```bash
-sir rm <name>
+sir rm <name-or-index>
+# example using status index:
+sir rm 2
 # remove all workspaces with no unstaged/untracked changes:
 sir rm --all-clean
 ```
