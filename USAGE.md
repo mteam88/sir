@@ -25,6 +25,8 @@ sir new <agent_cmd...>
 # optional explicit name:
 sir new --name <name> <agent_cmd...>
 # or: sir n -n <name> <agent_cmd...>
+# optional base revision:
+sir new --from <revision> <agent_cmd...>
 ```
 
 Example:
@@ -33,12 +35,14 @@ Example:
 sir new codex
 sir n claude -p "add retries to rpc client"
 sir new --name feature-auth codex
+sir new --from main codex
 ```
 
 What this does:
 - Creates/uses `.worktrees/<name>`
 - By default, asks Claude to generate `<name>` from your command and falls back to a generated two-word name (for example `pink elephant`) when Claude returns `null`
 - `--name` / `-n` lets you set `<name>` explicitly
+- `--from <revision>` sets the base revision for new workspace branch creation (default is `HEAD`)
 - Creates/uses a `sir/*` branch derived from `<name>` (whitespace normalized for branch safety)
 - Seeds new workspace with current uncommitted changes from the source repo
 - Runs your agent command in that workspace through `/bin/zsh`
@@ -80,15 +84,20 @@ sir rm <name>
 
 ```bash
 sir settle <name>
+# optional additional prompt:
+sir settle <name> --prompt "<additional instruction>"
 ```
 
 If you are already inside `.worktrees/<name>`, you can omit the name:
 
 ```bash
 sir settle
+# convenience form:
+sir settle "<additional instruction>"
 ```
 
 When `sir settle` is run from inside `.worktrees/<name>`, it opens a shell at the repo root after settle completes.
+When `sir settle "<additional instruction>"` is run inside a workspace, the quoted argument is passed to Claude as additional settle guidance (if it does not match an existing workspace name).
 
 ## Typical End-to-End Example
 

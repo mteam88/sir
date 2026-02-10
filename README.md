@@ -71,7 +71,7 @@ Checks include:
 - `git worktree` support (`git worktree list`)
 - Claude CLI installed
 
-### `sir new <agent_cmd...>` / `sir new --name <name> <agent_cmd...>` (alias: `sir n`)
+### `sir new [--name <name>] [--from <revision>] <agent_cmd...>` (alias: `sir n`)
 
 Creates/opens a workspace and then runs your agent command in that workspace in the current terminal.
 
@@ -82,11 +82,13 @@ Behavior:
   - sends your full `<agent_cmd...>` to Claude and asks for a short workspace name
   - if Claude returns `null` (or invalid output), falls back to a generated two-word name (for example: `pink elephant`)
 - Use `--name` / `-n` when you want an explicit workspace name
-- Creates new worktrees from `HEAD`
+- Creates new worktrees from `HEAD` by default
+  - use `--from <revision>` to choose a different base revision
 - Creates a worktree branch under `sir/*`:
   - derived from the workspace name (whitespace collapsed to `-` for branch safety)
   - if branch exists: `git worktree add repo/.worktrees/<name> <branch>`
-  - else: `git worktree add -b <branch> repo/.worktrees/<name> HEAD`
+  - else: `git worktree add -b <branch> repo/.worktrees/<name> <revision>`
+  - note: if branch already exists, `--from` is ignored
 - Newly created worktrees are seeded with current uncommitted changes from the source repo by default
   - applies tracked staged/unstaged diff from `HEAD`
   - copies untracked files (excluding ignored files)
@@ -108,6 +110,7 @@ sir new claude -p "fix flaky indexing test"
 sir n codex
 sir new --name feature-a claude -p "fix failing tests"
 sir n -n bugfix-42 codex
+sir new --from main codex
 ```
 
 ### `sir status [--json]` (alias: `sir t`)
@@ -155,7 +158,7 @@ Example:
 sir rm foo
 ```
 
-### `sir settle [<name>]` (alias: `sir s`)
+### `sir settle [<name>] [--prompt <text>]` (alias: `sir s`)
 
 Delegates integration of a workspace back to `main` to Claude.
 
@@ -166,6 +169,8 @@ Behavior:
   - omitted name: inferred from current directory when inside `.worktrees/<name>`
 - Runs Claude in workspace with `--dangerously-skip-permissions`
 - Uses `--model sonnet` by default (configurable via `claude_model`)
+- Appends `--prompt <text>` (or an inferred additional prompt) to the settle instructions
+  - convenience behavior: when run inside a workspace, `sir settle "extra instruction"` treats the argument as additional prompt if it is not an existing workspace name
 - Prompt instructs Claude to:
   - inspect status/diff/log with git
   - produce clean commit(s) and strong commit messages
@@ -182,6 +187,8 @@ Examples:
 ```bash
 sir settle foo
 cd .worktrees/foo && sir settle
+sir settle foo --prompt "run full test suite before final integration"
+cd .worktrees/foo && sir settle "run full test suite before final integration"
 ```
 
 ## Notes

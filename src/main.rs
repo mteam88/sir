@@ -21,14 +21,21 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Doctor => cmd_doctor(&config),
-        Commands::New { name, args } => {
-            let parsed = parse_new_command_args(name, args)?;
-            cmd_new(&config, parsed.name.as_deref(), &parsed.agent_cmd)
+        Commands::New { name, from, args } => {
+            let parsed = parse_new_command_args(name, from, args)?;
+            cmd_new(
+                &config,
+                parsed.name.as_deref(),
+                parsed.from.as_deref(),
+                &parsed.agent_cmd,
+            )
         }
         Commands::Status { json } => cmd_status(json),
         Commands::Open { name } => cmd_open(&name),
         Commands::Rm { name } => cmd_rm(&name),
-        Commands::Settle { name } => cmd_settle(&config, name.as_deref()),
+        Commands::Settle { name, prompt } => {
+            cmd_settle(&config, name.as_deref(), prompt.as_deref())
+        }
     }
 }
 
@@ -53,6 +60,9 @@ enum Commands {
         /// Optional explicit workspace name. If omitted, name is generated automatically.
         #[arg(short = 'n', long)]
         name: Option<String>,
+        /// Base revision used when creating a new workspace branch.
+        #[arg(long)]
+        from: Option<String>,
         /// Agent command to run in the workspace.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -69,7 +79,13 @@ enum Commands {
     Rm { name: String },
     /// Let Claude integrate a workspace back to main.
     #[command(alias = "s")]
-    Settle { name: Option<String> },
+    Settle {
+        /// Optional workspace name. If omitted, inferred from cwd when inside `.worktrees/<name>`.
+        name: Option<String>,
+        /// Extra instructions appended to the settle Claude prompt.
+        #[arg(short = 'p', long = "prompt")]
+        prompt: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -249,10 +265,15 @@ fn cmd_doctor(config: &Config) -> Result<()> {
 #[derive(Debug)]
 struct ParsedNewCommand {
     name: Option<String>,
+    from: Option<String>,
     agent_cmd: Vec<String>,
 }
 
-fn parse_new_command_args(name: Option<String>, args: Vec<String>) -> Result<ParsedNewCommand> {
+fn parse_new_command_args(
+    name: Option<String>,
+    from: Option<String>,
+    args: Vec<String>,
+) -> Result<ParsedNewCommand> {
     if args.is_empty() {
         bail!("agent command must not be empty");
     }
@@ -260,17 +281,24 @@ fn parse_new_command_args(name: Option<String>, args: Vec<String>) -> Result<Par
     if let Some(name) = name {
         return Ok(ParsedNewCommand {
             name: Some(name),
+            from,
             agent_cmd: args,
         });
     }
 
     Ok(ParsedNewCommand {
         name: None,
+        from,
         agent_cmd: args,
     })
 }
 
-fn cmd_new(config: &Config, explicit_name: Option<&str>, agent_cmd: &[String]) -> Result<()> {
+fn cmd_new(
+    config: &Config,
+    explicit_name: Option<&str>,
+    from_revision: Option<&str>,
+    agent_cmd: &[String],
+) -> Result<()> {
     let repo_root = repo_root()?;
     let (worktrees_dir, _) = ensure_worktrees_dir(&repo_root)?;
     let name =
@@ -317,10 +345,21 @@ fn cmd_new(config: &Config, explicit_name: Option<&str>, agent_cmd: &[String]) -
 
     if !workspace_path.exists() {
         progress("new: creating git worktree");
-        let revision = "HEAD".to_string();
+        let revision = from_revision.unwrap_or("HEAD").trim();
+        if revision.is_empty() {
+            bail!("--from must not be empty");
+        }
+        if !git_revision_exists(&repo_root, revision) {
+            bail!("revision `{revision}` is not valid or cannot be resolved");
+        }
         let workspace_branch = workspace_branch_name(&repo_root, &name)?;
         let workspace_str = path_to_str(&workspace_path)?;
         let output = if git_branch_exists(&repo_root, &workspace_branch) {
+            if from_revision.is_some() {
+                progress(&format!(
+                    "new: branch `{workspace_branch}` already exists; ignoring `--from {revision}`"
+                ));
+            }
             run_capture(
                 "git",
                 &["worktree", "add", workspace_str, &workspace_branch],
@@ -335,7 +374,7 @@ fn cmd_new(config: &Config, explicit_name: Option<&str>, agent_cmd: &[String]) -
                     "-b",
                     &workspace_branch,
                     workspace_str,
-                    &revision,
+                    revision,
                 ],
                 Some(&repo_root),
             )?
@@ -667,13 +706,15 @@ fn cmd_status(as_json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
+fn cmd_settle(config: &Config, maybe_name: Option<&str>, prompt: Option<&str>) -> Result<()> {
     progress("settle: resolving workspace");
     let repo_root = repo_common_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
     let started_in_worktree = invoked_from_worktree(&worktrees_dir);
+    let (effective_name, additional_prompt) =
+        normalize_settle_inputs(&worktrees_dir, started_in_worktree, maybe_name, prompt);
 
-    let (name, workspace_path) = match maybe_name {
+    let (name, workspace_path) = match effective_name.as_deref() {
         Some(name) => {
             validate_workspace_name(name)?;
             let path = worktrees_dir.join(name);
@@ -687,7 +728,7 @@ fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
     };
 
     progress("settle: running integration via Claude");
-    let settle_prompt = settle_prompt(&name, &workspace_path);
+    let settle_prompt = settle_prompt(&name, &workspace_path, additional_prompt.as_deref());
     run_claude(config, &settle_prompt, &workspace_path)?;
 
     progress("settle: running post-checks");
@@ -821,11 +862,21 @@ fn new_init_prompt(workspace_path: &Path) -> String {
     )
 }
 
-fn settle_prompt(name: &str, workspace_path: &Path) -> String {
-    format!(
+fn settle_prompt(name: &str, workspace_path: &Path, additional_prompt: Option<&str>) -> String {
+    let mut prompt = format!(
         "You are in workspace `{name}` at `{}`.\n\nGoal: integrate this workspace back into `main` using git.\n\nRequirements:\n- Inspect changes with git status/diff/log.\n- Ensure changes are in a clean commit (or a small clean commit stack) with excellent commit message quality based on the diff intent.\n- Rebase or merge onto the latest `main` and resolve conflicts.\n- Integrate the result onto `main` using git primitives.\n- Do not remove/delete/prune this worktree (do not run `git worktree remove`); workspace cleanup is handled separately.\n- If .env.example or any similar example-env file changed, update .env by adding new keys/defaults without overwriting existing secrets.\n- Leave the workspace and main in a sensible state.\n- Run commands directly with no follow-up questions unless absolutely blocked.",
         workspace_path.display()
-    )
+    );
+    if let Some(extra) = additional_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        prompt.push_str(
+            "\n\nAdditional user instructions:\n- Follow this extra instruction exactly: ",
+        );
+        prompt.push_str(extra);
+    }
+    prompt
 }
 
 fn run_claude(config: &Config, prompt: &str, cwd: &Path) -> Result<()> {
@@ -1347,6 +1398,40 @@ fn git_branch_name_valid(repo_root: &Path, branch: &str) -> bool {
     .unwrap_or(false)
 }
 
+fn git_revision_exists(repo_root: &Path, revision: &str) -> bool {
+    run_capture(
+        "git",
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{revision}^{{commit}}"),
+        ],
+        Some(repo_root),
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
+}
+
+fn normalize_settle_inputs(
+    worktrees_dir: &Path,
+    started_in_worktree: bool,
+    maybe_name: Option<&str>,
+    prompt: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let mut effective_name = maybe_name.map(str::to_string);
+    let mut additional_prompt = prompt.map(str::to_string);
+    if additional_prompt.is_none()
+        && started_in_worktree
+        && let Some(candidate) = effective_name.as_ref()
+        && !worktrees_dir.join(candidate).is_dir()
+    {
+        additional_prompt = Some(candidate.clone());
+        effective_name = None;
+    }
+    (effective_name, additional_prompt)
+}
+
 fn binary_available(bin: &str) -> bool {
     Command::new(bin)
         .arg("--version")
@@ -1606,7 +1691,21 @@ fn path_to_str(path: &Path) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex as StdMutex, OnceLock as StdOnceLock};
     use tempfile::TempDir;
+
+    fn cwd_lock() -> &'static StdMutex<()> {
+        static LOCK: StdOnceLock<StdMutex<()>> = StdOnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct CwdReset(PathBuf);
+
+    impl Drop for CwdReset {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.0);
+        }
+    }
 
     #[test]
     fn test_matches_worktrees_ignore_line() {
@@ -1632,15 +1731,16 @@ mod tests {
 
     #[test]
     fn test_infer_workspace_from_cwd() {
+        let _cwd_guard = cwd_lock().lock().expect("lock cwd");
         let temp = TempDir::new().expect("tempdir");
         let worktrees = temp.path().join(".worktrees");
         let target = worktrees.join("foo").join("src");
         fs::create_dir_all(&target).expect("mkdir tree");
 
         let old = env::current_dir().expect("cwd");
+        let _reset = CwdReset(old);
         env::set_current_dir(&target).expect("set cwd");
         let inferred = infer_workspace_from_cwd(&worktrees).expect("infer workspace");
-        env::set_current_dir(old).expect("restore cwd");
 
         assert_eq!(inferred.0, "foo");
         let expected = worktrees
@@ -1655,19 +1755,19 @@ mod tests {
 
     #[test]
     fn test_invoked_from_worktree() {
+        let _cwd_guard = cwd_lock().lock().expect("lock cwd");
         let temp = TempDir::new().expect("tempdir");
         let worktrees = temp.path().join(".worktrees");
         let target = worktrees.join("foo").join("src");
         fs::create_dir_all(&target).expect("mkdir tree");
 
         let old = env::current_dir().expect("cwd");
+        let _reset = CwdReset(old);
         env::set_current_dir(&target).expect("set cwd");
         assert!(invoked_from_worktree(&worktrees));
 
         env::set_current_dir(temp.path()).expect("set cwd to temp root");
         assert!(!invoked_from_worktree(&worktrees));
-
-        env::set_current_dir(old).expect("restore cwd");
     }
 
     #[test]
@@ -1773,11 +1873,13 @@ mod tests {
     fn test_parse_new_command_args_named_flag() {
         let parsed = parse_new_command_args(
             Some("feature".to_string()),
+            Some("main".to_string()),
             vec!["claude".to_string(), "-p".to_string()],
         )
         .expect("parse args");
 
         assert_eq!(parsed.name.as_deref(), Some("feature"));
+        assert_eq!(parsed.from.as_deref(), Some("main"));
         assert_eq!(
             parsed.agent_cmd,
             vec!["claude".to_string(), "-p".to_string()]
@@ -1786,10 +1888,12 @@ mod tests {
 
     #[test]
     fn test_parse_new_command_args_auto_default() {
-        let parsed = parse_new_command_args(None, vec!["claude".to_string(), "-p".to_string()])
-            .expect("parse args");
+        let parsed =
+            parse_new_command_args(None, None, vec!["claude".to_string(), "-p".to_string()])
+                .expect("parse args");
 
         assert_eq!(parsed.name, None);
+        assert_eq!(parsed.from, None);
         assert_eq!(
             parsed.agent_cmd,
             vec!["claude".to_string(), "-p".to_string()]
@@ -1798,7 +1902,7 @@ mod tests {
 
     #[test]
     fn test_parse_new_command_args_missing_agent_command() {
-        let err = parse_new_command_args(None, vec![]).expect_err("error");
+        let err = parse_new_command_args(None, None, vec![]).expect_err("error");
         assert!(
             err.to_string().contains("agent command must not be empty"),
             "unexpected error: {err}"
@@ -1852,5 +1956,38 @@ mod tests {
     fn test_validate_workspace_name_rejects_dot_paths() {
         assert!(validate_workspace_name(".").is_err());
         assert!(validate_workspace_name("..").is_err());
+    }
+
+    #[test]
+    fn test_settle_prompt_includes_additional_prompt() {
+        let prompt = settle_prompt("foo", Path::new("/tmp/foo"), Some("also run tests"));
+        assert!(prompt.contains("Additional user instructions"));
+        assert!(prompt.contains("also run tests"));
+    }
+
+    #[test]
+    fn test_settle_prompt_omits_additional_prompt_when_empty() {
+        let prompt = settle_prompt("foo", Path::new("/tmp/foo"), Some("   "));
+        assert!(!prompt.contains("Additional user instructions"));
+    }
+
+    #[test]
+    fn test_normalize_settle_inputs_uses_name_as_prompt_inside_worktree() {
+        let temp = TempDir::new().expect("tempdir");
+        let worktrees = temp.path().join(".worktrees");
+        fs::create_dir_all(worktrees.join("foo")).expect("mkdir foo");
+        let (name, prompt) = normalize_settle_inputs(&worktrees, true, Some("run tests"), None);
+        assert_eq!(name, None);
+        assert_eq!(prompt.as_deref(), Some("run tests"));
+    }
+
+    #[test]
+    fn test_normalize_settle_inputs_keeps_existing_workspace_name() {
+        let temp = TempDir::new().expect("tempdir");
+        let worktrees = temp.path().join(".worktrees");
+        fs::create_dir_all(worktrees.join("foo")).expect("mkdir foo");
+        let (name, prompt) = normalize_settle_inputs(&worktrees, true, Some("foo"), None);
+        assert_eq!(name.as_deref(), Some("foo"));
+        assert_eq!(prompt, None);
     }
 }
