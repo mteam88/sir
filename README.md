@@ -1,40 +1,36 @@
 # sir
 
-Minimal workspace wrapper for `git worktree` + Claude CLI in a raw terminal workflow.
+Opinionated & intelligent workspace management cli for parallel coding agents, wraps git worktrees.
 
 ## What It Does
 
 - Creates isolated workspaces under `repo/.worktrees/<name>/`
-- Uses `git worktree` as the only backend
-- Delegates initialization copy and settle/integration to Claude CLI with `--dangerously-skip-permissions`
-- Uses Claude model `sonnet` by default for internal Claude tasks (`new` init + `settle`)
-- Enables Claude streaming output (`stream-json` + partial messages) and renders text deltas live
+- Delegates initialization to Claude CLI (copies untracked .env files, target/, node_modules, etc.)
+- Automatically intelligent merges changes from workspaces onto the repo root using the Claude CLI
 - Runs agent commands directly in your current terminal
 
 ## Requirements
 
 - `git`
-- Claude CLI (`claude`)
+- Claude Code CLI (`claude`)
 
 ## Install
 
-Build:
-
-```bash
-cargo build --release
-```
-
-Run from repo root:
-
-```bash
-./target/release/sir --help
-```
-
-Or install globally:
+Clone, then install globally:
 
 ```bash
 cargo install --path .
 ```
+
+## Opiononated Workflow
+
+1. Decide to build a new feature, add tests, etc. e.g. `fix cargo test`
+2. `sir n codex "fix cargo test"` - auto generates a workspace name and opens the codex tui with my prompt
+3. Follow-ups in codex and testing in terminal or review in Cursor
+4. `sir settle` in workspace directory to intelligently settle back to main with auto-generated clean commits
+5. Repeat & parallelize!
+
+Read the whole README, there are useful tips!
 
 ## Configuration
 
@@ -71,7 +67,7 @@ Checks include:
 - `git worktree` support (`git worktree list`)
 - Claude CLI installed
 
-### `sir new [--name <name>] [--from <revision>] <agent_cmd...>` (alias: `sir n`)
+### `sir new [--name/-n <name>] [--from <revision>] <agent_cmd...>` (alias: `sir n`)
 
 Creates/opens a workspace and then runs your agent command in that workspace in the current terminal.
 
