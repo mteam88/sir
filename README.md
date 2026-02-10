@@ -100,8 +100,8 @@ Behavior:
   - `node_modules/` (if present)
   - no symlinks
   - uses `--model sonnet` by default (configurable via `claude_model`)
-- Runs `<agent_cmd...>` through `/bin/zsh` with cwd set to the workspace
-- After the agent command exits, leaves you in an interactive `/bin/zsh` in that workspace
+- Runs `<agent_cmd...>` through your `$SHELL` with cwd set to the workspace
+- After the agent command exits, leaves you in an interactive `$SHELL` in that workspace
 
 Examples:
 

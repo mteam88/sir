@@ -45,8 +45,8 @@ What this does:
 - `--from <revision>` sets the base revision for new workspace branch creation (default is `HEAD`)
 - Creates/uses a `sir/*` branch derived from `<name>` (whitespace normalized for branch safety)
 - Seeds new workspace with current uncommitted changes from the source repo
-- Runs your agent command in that workspace through `/bin/zsh`
-- Leaves you in a workspace `/bin/zsh` prompt after the agent command exits
+- Runs your agent command in that workspace through your `$SHELL`
+- Leaves you in a workspace `$SHELL` prompt after the agent command exits
 
 3. Do your implementation work in the workspace:
 

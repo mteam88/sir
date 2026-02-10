@@ -833,20 +833,21 @@ fn run_agent_command(agent_cmd: &[String], workspace_path: &Path) -> Result<()> 
 }
 
 fn run_agent_command_with_shell(agent_cmd: &[String], workspace_path: &Path) -> Result<()> {
-    let zsh = "/bin/zsh";
-    if !Path::new(zsh).exists() {
-        bail!("new requires `{zsh}` to exist");
+    let shell = preferred_shell();
+    if !Path::new(&shell).exists() {
+        bail!("new requires `$SHELL` to reference an existing shell (got `{shell}`)");
     }
 
     let command = shell_join(agent_cmd);
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return run_stream(zsh, &["-c", &command], Some(workspace_path))
-            .context("failed to run agent command inside /bin/zsh");
+        return run_stream(&shell, &["-c", &command], Some(workspace_path))
+            .with_context(|| format!("failed to run agent command inside `{shell}`"));
     }
 
-    let script = format!("{command};\necho;\nexec {zsh} -i");
-    run_stream(zsh, &["-i", "-c", &script], Some(workspace_path))
-        .context("failed to run agent command inside zsh")
+    let shell_quoted = shell_quote(&shell);
+    let script = format!("{command};\necho;\nexec {shell_quoted} -i");
+    run_stream(&shell, &["-i", "-c", &script], Some(workspace_path))
+        .with_context(|| format!("failed to run agent command inside `{shell}`"))
 }
 
 fn shell_join(args: &[String]) -> String {
@@ -869,6 +870,13 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn preferred_shell() -> String {
+    env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "sh".to_string())
+}
+
 fn run_workspace_shell(workspace_path: &Path) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         println!(
@@ -878,10 +886,7 @@ fn run_workspace_shell(workspace_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let shell = env::var("SHELL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "sh".to_string());
+    let shell = preferred_shell();
 
     println!("Opening shell `{shell}` in {}", workspace_path.display());
     run_stream(&shell, &[], Some(workspace_path))
@@ -895,10 +900,7 @@ fn settle_to_repo_root(repo_root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let shell = env::var("SHELL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "sh".to_string());
+    let shell = preferred_shell();
 
     println!(
         "\nSettle complete. Opening shell `{shell}` in {}",
