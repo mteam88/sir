@@ -167,6 +167,7 @@ Behavior:
   - update `.env` when example env files changed (without overwriting secrets)
 - After Claude returns, prints post-check:
   - `git status -sb` at repo root
+- If `sir settle` is run while your current directory is inside `.worktrees/<name>`, it opens an interactive shell at the repo root after settle completes
 
 Examples:
 

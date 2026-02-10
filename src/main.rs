@@ -439,6 +439,7 @@ fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
     progress("settle: resolving workspace");
     let repo_root = repo_common_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
+    let started_in_worktree = invoked_from_worktree(&worktrees_dir);
 
     let (name, workspace_path) = match maybe_name {
         Some(name) => {
@@ -466,6 +467,10 @@ fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
         Err(err) => {
             println!("- git status -sb failed: {err}");
         }
+    }
+
+    if started_in_worktree {
+        settle_to_repo_root(&repo_root)?;
     }
 
     Ok(())
@@ -539,6 +544,26 @@ fn run_workspace_shell(workspace_path: &Path) -> Result<()> {
     println!("Opening shell `{shell}` in {}", workspace_path.display());
     run_stream(&shell, &[], Some(workspace_path))
         .with_context(|| format!("failed to run `{shell}`"))
+}
+
+fn settle_to_repo_root(repo_root: &Path) -> Result<()> {
+    progress("settle: returning to repo root");
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        println!("\nSettle complete. Repo root: {}", repo_root.display());
+        return Ok(());
+    }
+
+    let shell = env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "sh".to_string());
+
+    println!(
+        "\nSettle complete. Opening shell `{shell}` in {}",
+        repo_root.display()
+    );
+    run_stream(&shell, &[], Some(repo_root))
+        .with_context(|| format!("failed to run `{shell}` at repo root"))
 }
 
 fn print_command_output(command: &str, stdout: &str, stderr: &str) {
@@ -974,6 +999,10 @@ fn infer_workspace_from_cwd(worktrees_dir: &Path) -> Option<(String, PathBuf)> {
     infer_workspace_from_paths(&canonical_worktrees, &canonical_cwd)
 }
 
+fn invoked_from_worktree(worktrees_dir: &Path) -> bool {
+    infer_workspace_from_cwd(worktrees_dir).is_some()
+}
+
 fn infer_workspace_from_paths(worktrees_dir: &Path, cwd: &Path) -> Option<(String, PathBuf)> {
     let stripped = cwd.strip_prefix(worktrees_dir).ok()?;
     let mut components = stripped.components();
@@ -1305,6 +1334,23 @@ mod tests {
             inferred.1.canonicalize().expect("canonical inferred path"),
             expected
         );
+    }
+
+    #[test]
+    fn test_invoked_from_worktree() {
+        let temp = TempDir::new().expect("tempdir");
+        let worktrees = temp.path().join(".worktrees");
+        let target = worktrees.join("foo").join("src");
+        fs::create_dir_all(&target).expect("mkdir tree");
+
+        let old = env::current_dir().expect("cwd");
+        env::set_current_dir(&target).expect("set cwd");
+        assert!(invoked_from_worktree(&worktrees));
+
+        env::set_current_dir(temp.path()).expect("set cwd to temp root");
+        assert!(!invoked_from_worktree(&worktrees));
+
+        env::set_current_dir(old).expect("restore cwd");
     }
 
     #[test]

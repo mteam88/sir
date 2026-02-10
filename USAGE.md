@@ -81,6 +81,8 @@ If you are already inside `.worktrees/<name>`, you can omit the name:
 sir settle
 ```
 
+When `sir settle` is run from inside `.worktrees/<name>`, it opens a shell at the repo root after settle completes.
+
 ## Typical End-to-End Example
 
 ```bash
