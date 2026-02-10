@@ -1,8 +1,14 @@
+mod constants;
 mod shell;
 mod workspace_name;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use constants::{
+    DEFAULT_WORKSPACE_REVISION, PORCELAIN_STATUS_MIN_BYTES, RESERVED_WORKTREE_LOGS,
+    RESERVED_WORKTREE_TMP, STATUS_SUMMARY_MAX_LINES, STATUS_TRUNCATE_MAX_CHARS,
+    TRUNCATE_ELLIPSIS_CHARS,
+};
 use serde::{Deserialize, Serialize};
 use shell::{preferred_shell, shell_join, shell_quote};
 use std::env;
@@ -343,7 +349,7 @@ fn cmd_new(
 
     if !workspace_path.exists() {
         progress("new: creating git worktree");
-        let revision = from_revision.unwrap_or("HEAD").trim();
+        let revision = from_revision.unwrap_or(DEFAULT_WORKSPACE_REVISION).trim();
         if revision.is_empty() {
             bail!("--from must not be empty");
         }
@@ -755,7 +761,7 @@ fn cmd_status(as_json: bool) -> Result<()> {
             "{:<24} {:<8} {}",
             row.name,
             row.backend,
-            truncate(&row.summary, 100)
+            truncate(&row.summary, STATUS_TRUNCATE_MAX_CHARS)
         );
     }
 
@@ -1189,7 +1195,7 @@ fn squash_status_lines(raw: &str) -> String {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .take(3)
+        .take(STATUS_SUMMARY_MAX_LINES)
         .collect();
     if lines.is_empty() {
         "clean".to_string()
@@ -1218,7 +1224,7 @@ fn workspace_has_unstaged_changes(workspace_path: &Path) -> Result<bool> {
 
 fn porcelain_line_has_unstaged_changes(line: &str) -> bool {
     let bytes = line.as_bytes();
-    if bytes.len() < 2 {
+    if bytes.len() < PORCELAIN_STATUS_MIN_BYTES {
         return true;
     }
     bytes[1] != b' '
@@ -1228,11 +1234,11 @@ fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_string();
     }
-    value
+    let head = value
         .chars()
-        .take(max.saturating_sub(3))
-        .collect::<String>()
-        + "..."
+        .take(max.saturating_sub(TRUNCATE_ELLIPSIS_CHARS))
+        .collect::<String>();
+    format!("{head}...")
 }
 
 fn validate_workspace_name(name: &str) -> Result<()> {
@@ -1242,7 +1248,7 @@ fn validate_workspace_name(name: &str) -> Result<()> {
     if name == "." || name == ".." {
         bail!("workspace name `{name}` is invalid");
     }
-    if name == "_logs" || name == "_tmp" {
+    if name == RESERVED_WORKTREE_LOGS || name == RESERVED_WORKTREE_TMP {
         bail!("workspace name `{name}` is reserved");
     }
     if name.contains('/') || name.contains('\\') {
@@ -1345,7 +1351,7 @@ fn list_workspace_dirs(worktrees_dir: &Path) -> Result<Vec<(String, PathBuf)>> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == "_logs" || name == "_tmp" {
+        if name == RESERVED_WORKTREE_LOGS || name == RESERVED_WORKTREE_TMP {
             continue;
         }
         entries.push((name, entry.path()));

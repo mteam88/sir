@@ -1,10 +1,11 @@
+use crate::constants::DEFAULT_SHELL;
 use std::env;
 
 pub(crate) fn preferred_shell() -> String {
     env::var("SHELL")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "sh".to_string())
+        .unwrap_or_else(|| DEFAULT_SHELL.to_string())
 }
 
 pub(crate) fn shell_join(args: &[String]) -> String {

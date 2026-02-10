@@ -1,3 +1,7 @@
+use crate::constants::{
+    FALLBACK_NAME_ATTEMPTS, FALLBACK_NAME_DEFAULT, FALLBACK_NAME_SUFFIX_OFFSET,
+    FALLBACK_NAME_SUFFIX_START, PSEUDO_RANDOM_MIX_A, PSEUDO_RANDOM_MIX_B,
+};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,20 +15,20 @@ const NOUNS: &[&str] = &[
 ];
 
 pub(crate) fn fallback_workspace_name(worktrees_dir: &Path) -> String {
-    for attempt in 0..100u64 {
+    for attempt in 0..FALLBACK_NAME_ATTEMPTS {
         let adjective = ADJECTIVES[pseudo_random_index(ADJECTIVES.len(), attempt)];
-        let noun = NOUNS[pseudo_random_index(NOUNS.len(), attempt + 97)];
+        let noun = NOUNS[pseudo_random_index(NOUNS.len(), attempt + FALLBACK_NAME_SUFFIX_OFFSET)];
         let base = format!("{adjective} {noun}");
         if !worktrees_dir.join(&base).exists() {
             return base;
         }
-        let with_suffix = format!("{base} {}", attempt + 2);
+        let with_suffix = format!("{base} {}", attempt + FALLBACK_NAME_SUFFIX_START);
         if !worktrees_dir.join(&with_suffix).exists() {
             return with_suffix;
         }
     }
 
-    "pink elephant".to_string()
+    FALLBACK_NAME_DEFAULT.to_string()
 }
 
 fn pseudo_random_index(len: usize, salt: u64) -> usize {
@@ -37,9 +41,9 @@ fn pseudo_random_index(len: usize, salt: u64) -> usize {
         .unwrap_or_default()
         .as_nanos() as u64;
     let pid = std::process::id() as u64;
-    let mut value = nanos ^ pid.rotate_left(17) ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut value = nanos ^ pid.rotate_left(17) ^ salt.wrapping_mul(PSEUDO_RANDOM_MIX_A);
     value ^= value >> 33;
-    value = value.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    value = value.wrapping_mul(PSEUDO_RANDOM_MIX_B);
     value ^= value >> 33;
     (value as usize) % len
 }
