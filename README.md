@@ -115,7 +115,7 @@ sir new --from main codex
 
 ### `sir status [--json]` (alias: `sir t`)
 
-Stateless workspace listing from `.worktrees/` (excluding `_logs`, `_tmp`).
+Workspace listing from `.worktrees/` (excluding `_logs`, `_tmp`) plus any other linked git worktrees for this repo (for example Codex-managed external worktrees).
 
 For each workspace, prints:
 
@@ -174,7 +174,7 @@ Behavior:
 
 - Workspace resolution:
   - provided name: `repo/.worktrees/<name>`
-  - omitted name: inferred from current directory when inside `.worktrees/<name>`
+  - omitted name: inferred from current directory when inside a linked git worktree (`.worktrees/<name>` or an external worktree path such as Codex-managed worktrees)
 - Runs Claude in workspace with `--dangerously-skip-permissions`
 - Uses `--model sonnet` by default (configurable via `claude_model`)
 - Appends `--prompt <text>` (or an inferred additional prompt) to the settle instructions
@@ -188,7 +188,7 @@ Behavior:
   - update `.env` when example env files changed (without overwriting secrets)
 - After Claude returns, prints post-check:
   - `git status -sb` at repo root
-- If `sir settle` is run while your current directory is inside `.worktrees/<name>`, it opens an interactive shell at the repo root after settle completes
+- If `sir settle` is run while your current directory is inside a linked worktree, it opens an interactive shell at the repo root after settle completes
 
 Examples:
 
@@ -197,6 +197,8 @@ sir settle foo
 cd .worktrees/foo && sir settle
 sir settle foo --prompt "run full test suite before final integration"
 cd .worktrees/foo && sir settle "run full test suite before final integration"
+# also works from external linked worktrees (example path shape):
+cd ~/.codex/worktrees/3ed7/sir && sir settle
 ```
 
 ## Notes

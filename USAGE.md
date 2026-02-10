@@ -62,6 +62,8 @@ sir status
 # or: sir t
 ```
 
+`sir status` includes both `repo/.worktrees/*` and other linked git worktrees for the same repo (such as external Codex worktrees).
+
 JSON output:
 
 ```bash
@@ -90,7 +92,7 @@ sir settle <name>
 sir settle <name> --prompt "<additional instruction>"
 ```
 
-If you are already inside `.worktrees/<name>`, you can omit the name:
+If you are already inside a linked worktree (`.worktrees/<name>` or an external linked path like `~/.codex/worktrees/<id>/<repo>`), you can omit the name:
 
 ```bash
 sir settle
@@ -98,7 +100,7 @@ sir settle
 sir settle "<additional instruction>"
 ```
 
-When `sir settle` is run from inside `.worktrees/<name>`, it opens a shell at the repo root after settle completes.
+When `sir settle` is run from inside a linked worktree, it opens a shell at the repo root after settle completes.
 When `sir settle "<additional instruction>"` is run inside a workspace, the quoted argument is passed to Claude as additional settle guidance (if it does not match an existing workspace name).
 
 ## Typical End-to-End Example

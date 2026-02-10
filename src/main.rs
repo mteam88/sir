@@ -97,7 +97,7 @@ enum Commands {
     /// Let Claude integrate a workspace back to main.
     #[command(alias = "s")]
     Settle {
-        /// Optional workspace name. If omitted, inferred from cwd when inside `.worktrees/<name>`.
+        /// Optional workspace name. If omitted, inferred from cwd when inside a linked git worktree.
         name: Option<String>,
         /// Extra instructions appended to the settle Claude prompt.
         #[arg(short = 'p', long = "prompt")]
@@ -782,20 +782,41 @@ fn cmd_rm_all_clean() -> Result<()> {
 
 fn cmd_status(as_json: bool) -> Result<()> {
     progress("status: scanning workspaces");
-    let repo_root = repo_root()?;
+    let repo_root = repo_common_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
     let entries = list_workspace_dirs(&worktrees_dir)?;
 
     let mut rows = Vec::new();
+    let mut seen_paths = Vec::new();
     for (name, path) in entries {
         let backend = detect_workspace_backend(&path);
         let summary = workspace_status_summary(backend, &path);
         rows.push(StatusRow {
             name,
-            path,
+            path: path.clone(),
             backend: backend.to_string(),
             summary,
         });
+        seen_paths.push(path);
+    }
+
+    let linked_entries = list_external_git_workspaces(&repo_root, &worktrees_dir)?;
+    for linked in linked_entries {
+        if seen_paths
+            .iter()
+            .any(|existing| paths_equal(existing, &linked.path))
+        {
+            continue;
+        }
+        let backend = detect_workspace_backend(&linked.path);
+        let summary = workspace_status_summary(backend, &linked.path);
+        rows.push(StatusRow {
+            name: linked.name,
+            path: linked.path.clone(),
+            backend: backend.to_string(),
+            summary,
+        });
+        seen_paths.push(linked.path);
     }
 
     if as_json {
@@ -813,7 +834,10 @@ fn cmd_status(as_json: bool) -> Result<()> {
     }
 
     if rows.is_empty() {
-        println!("No workspaces found under {}", worktrees_dir.display());
+        println!(
+            "No workspaces found under {} or linked via git worktree",
+            worktrees_dir.display()
+        );
         return Ok(());
     }
 
@@ -830,11 +854,115 @@ fn cmd_status(as_json: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct LinkedWorkspaceEntry {
+    name: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitWorktreeEntry {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn list_external_git_workspaces(
+    repo_root: &Path,
+    worktrees_dir: &Path,
+) -> Result<Vec<LinkedWorkspaceEntry>> {
+    let entries = list_git_worktrees(repo_root)?;
+    let mut linked = Vec::new();
+    for entry in entries {
+        if paths_equal(&entry.path, repo_root) || path_is_within_dir(&entry.path, worktrees_dir) {
+            continue;
+        }
+        let name = entry.branch.clone().unwrap_or_else(|| {
+            entry
+                .path
+                .file_name()
+                .map(|value| value.to_string_lossy().to_string())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| entry.path.display().to_string())
+        });
+        linked.push(LinkedWorkspaceEntry {
+            name,
+            path: entry.path,
+        });
+    }
+    Ok(linked)
+}
+
+fn list_git_worktrees(repo_root: &Path) -> Result<Vec<GitWorktreeEntry>> {
+    let output = run_capture("git", &["worktree", "list", "--porcelain"], Some(repo_root))
+        .context("failed to list git worktrees")?;
+    if !output.status.success() {
+        bail!(
+            "failed to list git worktrees: {}",
+            best_error_line(&output.stderr)
+        );
+    }
+    Ok(parse_git_worktree_porcelain(&output.stdout))
+}
+
+fn parse_git_worktree_porcelain(raw: &str) -> Vec<GitWorktreeEntry> {
+    let mut entries = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_branch: Option<String> = None;
+
+    let flush_current = |entries: &mut Vec<GitWorktreeEntry>,
+                         current_path: &mut Option<PathBuf>,
+                         current_branch: &mut Option<String>| {
+        if let Some(path) = current_path.take() {
+            entries.push(GitWorktreeEntry {
+                path,
+                branch: current_branch.take(),
+            });
+        } else {
+            current_branch.take();
+        }
+    };
+
+    for line in raw.lines() {
+        if line.is_empty() {
+            flush_current(&mut entries, &mut current_path, &mut current_branch);
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("worktree ") {
+            flush_current(&mut entries, &mut current_path, &mut current_branch);
+            current_path = Some(PathBuf::from(value.trim()));
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("branch ")
+            && let Some(short) = value.trim().strip_prefix("refs/heads/")
+        {
+            current_branch = Some(short.to_string());
+            continue;
+        }
+    }
+
+    flush_current(&mut entries, &mut current_path, &mut current_branch);
+    entries
+}
+
+fn path_is_within_dir(path: &Path, dir: &Path) -> bool {
+    if path.starts_with(dir) {
+        return true;
+    }
+    match (path.canonicalize(), dir.canonicalize()) {
+        (Ok(canonical_path), Ok(canonical_dir)) => canonical_path.starts_with(canonical_dir),
+        _ => false,
+    }
+}
+
 fn cmd_settle(config: &Config, maybe_name: Option<&str>, prompt: Option<&str>) -> Result<()> {
     progress("settle: resolving workspace");
     let repo_root = repo_common_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
-    let started_in_worktree = invoked_from_worktree(&worktrees_dir);
+    let inferred_workspace = infer_workspace_from_cwd(&worktrees_dir)
+        .or_else(|| infer_workspace_from_current_git_worktree(&repo_root));
+    let started_in_worktree = inferred_workspace.is_some();
     let (effective_name, additional_prompt) =
         normalize_settle_inputs(&worktrees_dir, started_in_worktree, maybe_name, prompt);
 
@@ -847,8 +975,9 @@ fn cmd_settle(config: &Config, maybe_name: Option<&str>, prompt: Option<&str>) -
             }
             (name.to_string(), path)
         }
-        None => infer_workspace_from_cwd(&worktrees_dir)
-            .context("could not infer workspace name; pass one explicitly")?,
+        None => {
+            inferred_workspace.context("could not infer workspace name; pass one explicitly")?
+        }
     };
 
     progress("settle: running integration via Claude");
@@ -1482,8 +1611,75 @@ fn infer_workspace_from_cwd(worktrees_dir: &Path) -> Option<(String, PathBuf)> {
     infer_workspace_from_paths(&canonical_worktrees, &canonical_cwd)
 }
 
-fn invoked_from_worktree(worktrees_dir: &Path) -> bool {
-    infer_workspace_from_cwd(worktrees_dir).is_some()
+fn infer_workspace_from_current_git_worktree(repo_root: &Path) -> Option<(String, PathBuf)> {
+    let workspace_path = current_git_worktree_path()?;
+    let common_root = current_git_common_root()?;
+    if !paths_equal(&common_root, repo_root) || paths_equal(&workspace_path, repo_root) {
+        return None;
+    }
+
+    let workspace_name = current_git_branch_name()
+        .or_else(|| {
+            workspace_path
+                .file_name()
+                .map(|component| component.to_string_lossy().to_string())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| workspace_path.display().to_string());
+    Some((workspace_name, workspace_path))
+}
+
+fn current_git_worktree_path() -> Option<PathBuf> {
+    let output = run_capture(
+        "git",
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        None,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = output.stdout.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn current_git_common_root() -> Option<PathBuf> {
+    let output = run_capture(
+        "git",
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        None,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let common_dir = PathBuf::from(output.stdout.trim());
+    common_root_from_git_common_dir(&common_dir)
+}
+
+fn current_git_branch_name() -> Option<String> {
+    let output = run_capture("git", &["rev-parse", "--abbrev-ref", "HEAD"], None).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = output.stdout.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    Some(branch.to_string())
+}
+
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 fn infer_workspace_from_paths(worktrees_dir: &Path, cwd: &Path) -> Option<(String, PathBuf)> {
@@ -1834,6 +2030,29 @@ mod tests {
         }
     }
 
+    fn run_git_checked(cwd: &Path, args: &[&str]) {
+        let output = run_capture("git", args, Some(cwd)).expect("run git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+            args,
+            output.stdout,
+            output.stderr
+        );
+    }
+
+    fn init_test_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("mkdir repo");
+        run_git_checked(&repo, &["init"]);
+        run_git_checked(&repo, &["config", "user.email", "test@example.com"]);
+        run_git_checked(&repo, &["config", "user.name", "Test User"]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write README");
+        run_git_checked(&repo, &["add", "README.md"]);
+        run_git_checked(&repo, &["commit", "-m", "init"]);
+        repo
+    }
+
     #[test]
     fn test_matches_worktrees_ignore_line() {
         assert!(matches_worktrees_ignore_line(".worktrees/"));
@@ -1890,20 +2109,143 @@ mod tests {
     }
 
     #[test]
-    fn test_invoked_from_worktree() {
+    fn test_infer_workspace_from_current_git_worktree_external_path() {
         let _cwd_guard = cwd_lock().lock().expect("lock cwd");
         let temp = TempDir::new().expect("tempdir");
-        let worktrees = temp.path().join(".worktrees");
-        let target = worktrees.join("foo").join("src");
-        fs::create_dir_all(&target).expect("mkdir tree");
+        let repo = init_test_repo(temp.path());
+        let worktree = temp
+            .path()
+            .join(".codex")
+            .join("worktrees")
+            .join("3ed7")
+            .join("sir");
+        let worktree_parent = worktree.parent().expect("worktree parent");
+        fs::create_dir_all(worktree_parent).expect("mkdir worktree parent");
+        run_git_checked(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "codex/worktree-compatibility",
+                worktree.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        );
+        let nested = worktree.join("src");
+        fs::create_dir_all(&nested).expect("mkdir nested");
 
         let old = env::current_dir().expect("cwd");
         let _reset = CwdReset(old);
-        env::set_current_dir(&target).expect("set cwd");
-        assert!(invoked_from_worktree(&worktrees));
+        env::set_current_dir(&nested).expect("set cwd");
 
-        env::set_current_dir(temp.path()).expect("set cwd to temp root");
-        assert!(!invoked_from_worktree(&worktrees));
+        let inferred = infer_workspace_from_current_git_worktree(&repo).expect("infer workspace");
+        assert_eq!(inferred.0, "codex/worktree-compatibility");
+        assert_eq!(
+            inferred.1.canonicalize().expect("canonical inferred path"),
+            worktree.canonicalize().expect("canonical worktree path")
+        );
+    }
+
+    #[test]
+    fn test_infer_workspace_from_current_git_worktree_ignores_main_worktree() {
+        let _cwd_guard = cwd_lock().lock().expect("lock cwd");
+        let temp = TempDir::new().expect("tempdir");
+        let repo = init_test_repo(temp.path());
+
+        let old = env::current_dir().expect("cwd");
+        let _reset = CwdReset(old);
+        env::set_current_dir(&repo).expect("set cwd to repo root");
+
+        assert!(infer_workspace_from_current_git_worktree(&repo).is_none());
+    }
+
+    #[test]
+    fn test_parse_git_worktree_porcelain() {
+        let raw = "\
+worktree /tmp/repo
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/main
+
+worktree /tmp/codex
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/feature/test
+";
+        let entries = parse_git_worktree_porcelain(raw);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, PathBuf::from("/tmp/repo"));
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert_eq!(entries[1].path, PathBuf::from("/tmp/codex"));
+        assert_eq!(entries[1].branch.as_deref(), Some("feature/test"));
+    }
+
+    #[test]
+    fn test_parse_git_worktree_porcelain_detached() {
+        let raw = "\
+worktree /tmp/repo
+HEAD 1111111111111111111111111111111111111111
+
+worktree /tmp/detached
+HEAD 2222222222222222222222222222222222222222
+detached
+";
+        let entries = parse_git_worktree_porcelain(raw);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].branch, None);
+        assert_eq!(entries[1].branch, None);
+    }
+
+    #[test]
+    fn test_list_external_git_workspaces_excludes_main_and_local_worktrees() {
+        let _cwd_guard = cwd_lock().lock().expect("lock cwd");
+        let temp = TempDir::new().expect("tempdir");
+        let repo = init_test_repo(temp.path());
+        let local_worktrees = repo.join(".worktrees");
+        fs::create_dir_all(&local_worktrees).expect("mkdir local worktrees");
+
+        let local = local_worktrees.join("local");
+        run_git_checked(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "sir/local",
+                local.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        );
+
+        let external = temp
+            .path()
+            .join(".codex")
+            .join("worktrees")
+            .join("3ed7")
+            .join("sir");
+        fs::create_dir_all(external.parent().expect("external parent"))
+            .expect("mkdir external parent");
+        run_git_checked(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "codex/status-linked",
+                external.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        );
+
+        let linked = list_external_git_workspaces(&repo, &local_worktrees).expect("list linked");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].name, "codex/status-linked");
+        assert_eq!(
+            linked[0]
+                .path
+                .canonicalize()
+                .expect("canonical linked path"),
+            external.canonicalize().expect("canonical external path")
+        );
     }
 
     #[test]
