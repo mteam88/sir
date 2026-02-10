@@ -337,19 +337,7 @@ fn cmd_new(
                 "no tracked repository files"
             };
             eprintln!("warning: workspace `{name}` appears incomplete ({reason}); recreating it");
-            if let Ok(workspace_str) = path_to_str(&workspace_path) {
-                let _ = run_capture(
-                    "git",
-                    &["worktree", "remove", "--force", workspace_str],
-                    Some(&repo_root),
-                );
-            }
-            fs::remove_dir_all(&workspace_path).with_context(|| {
-                format!(
-                    "failed to remove incomplete workspace {}",
-                    workspace_path.display()
-                )
-            })?;
+            remove_workspace_for_recreate(&repo_root, &workspace_path)?;
         }
     }
 
@@ -392,12 +380,13 @@ fn cmd_new(
         if !output.status.success() {
             let error_line = best_error_line(&output.stderr);
             if workspace_path.exists() {
-                let _ = run_capture(
-                    "git",
-                    &["worktree", "remove", "--force", workspace_str],
-                    Some(&repo_root),
-                );
-                let _ = fs::remove_dir_all(&workspace_path);
+                if let Err(cleanup_err) = remove_workspace_for_recreate(&repo_root, &workspace_path)
+                {
+                    eprintln!(
+                        "warning: failed to clean workspace after create failure `{}`: {cleanup_err:#}",
+                        workspace_path.display()
+                    );
+                }
             }
             bail!("failed to create git worktree `{name}`: {error_line}");
         }
@@ -457,6 +446,43 @@ fn suggest_workspace_name_from_claude(
     let prompt = auto_name_prompt(agent_command);
     let output = run_claude_text(config, &prompt, cwd)?;
     Ok(parse_auto_name_response(&output))
+}
+
+fn remove_workspace_for_recreate(repo_root: &Path, workspace_path: &Path) -> Result<()> {
+    if workspace_path.exists() {
+        let workspace_str = path_to_str(workspace_path)?;
+        match run_capture(
+            "git",
+            &["worktree", "remove", "--force", workspace_str],
+            Some(repo_root),
+        ) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                eprintln!(
+                    "warning: git worktree remove failed for {}: {}",
+                    workspace_path.display(),
+                    best_error_line(&output.stderr)
+                );
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to run git worktree remove for {}: {err:#}",
+                    workspace_path.display()
+                );
+            }
+        }
+    }
+
+    if workspace_path.exists() {
+        fs::remove_dir_all(workspace_path).with_context(|| {
+            format!(
+                "failed to remove incomplete workspace {}",
+                workspace_path.display()
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 fn auto_name_prompt(agent_command: &str) -> String {
