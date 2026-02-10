@@ -48,7 +48,7 @@ git status -sb
 
 ```bash
 sir status
-# or: sir s
+# or: sir t
 ```
 
 JSON output:
@@ -87,7 +87,7 @@ sir settle
 sir doctor
 sir new bugfix-42 codex
 # ...make changes in .worktrees/bugfix-42...
-sir s
+sir t
 sir settle bugfix-42
 ```
 

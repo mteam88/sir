@@ -51,7 +51,7 @@ enum Commands {
         agent_cmd: Vec<String>,
     },
     /// Show discovered workspaces and status.
-    #[command(alias = "s")]
+    #[command(alias = "t")]
     Status {
         #[arg(long)]
         json: bool,
@@ -61,6 +61,7 @@ enum Commands {
     /// Remove a workspace by name.
     Rm { name: String },
     /// Let Claude integrate a workspace back to main.
+    #[command(alias = "s")]
     Settle { name: Option<String> },
 }
 

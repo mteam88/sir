@@ -103,7 +103,7 @@ sir new foo codex
 sir n feature-a claude -p "fix failing tests"
 ```
 
-### `sir status [--json]` (alias: `sir s`)
+### `sir status [--json]` (alias: `sir t`)
 
 Stateless workspace listing from `.worktrees/` (excluding `_logs`, `_tmp`).
 
@@ -117,7 +117,7 @@ Examples:
 
 ```bash
 sir status
-sir s --json
+sir t --json
 ```
 
 ### `sir open <name>`
@@ -148,7 +148,7 @@ Example:
 sir rm foo
 ```
 
-### `sir settle [<name>]`
+### `sir settle [<name>]` (alias: `sir s`)
 
 Delegates integration of a workspace back to `main` to Claude.
 
