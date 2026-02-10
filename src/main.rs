@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -126,15 +126,15 @@ impl Config {
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
             let parsed: PartialConfig = toml::from_str(&raw)
                 .with_context(|| format!("failed to parse config file {}", path.display()))?;
-            if let Some(claude_bin) = parsed.claude_bin
-                && !claude_bin.trim().is_empty()
-            {
-                config.claude_bin = claude_bin;
+            if let Some(claude_bin) = parsed.claude_bin {
+                if !claude_bin.trim().is_empty() {
+                    config.claude_bin = claude_bin;
+                }
             }
-            if let Some(claude_model) = parsed.claude_model
-                && !claude_model.trim().is_empty()
-            {
-                config.claude_model = claude_model;
+            if let Some(claude_model) = parsed.claude_model {
+                if !claude_model.trim().is_empty() {
+                    config.claude_model = claude_model;
+                }
             }
             break;
         }
@@ -1516,13 +1516,13 @@ fn normalize_settle_inputs(
 ) -> (Option<String>, Option<String>) {
     let mut effective_name = maybe_name.map(str::to_string);
     let mut additional_prompt = prompt.map(str::to_string);
-    if additional_prompt.is_none()
-        && started_in_worktree
-        && let Some(candidate) = effective_name.as_ref()
-        && !worktrees_dir.join(candidate).is_dir()
-    {
-        additional_prompt = Some(candidate.clone());
-        effective_name = None;
+    if additional_prompt.is_none() && started_in_worktree {
+        if let Some(candidate) = effective_name.as_ref() {
+            if !worktrees_dir.join(candidate).is_dir() {
+                additional_prompt = Some(candidate.clone());
+                effective_name = None;
+            }
+        }
     }
     (effective_name, additional_prompt)
 }
@@ -1696,11 +1696,13 @@ fn parse_claude_stream_line(line: &str) -> ClaudeStreamLine {
             .pointer("/event/delta/type")
             .and_then(serde_json::Value::as_str)
             == Some("text_delta")
-        && let Some(text) = parsed
+    {
+        if let Some(text) = parsed
             .pointer("/event/delta/text")
             .and_then(serde_json::Value::as_str)
-    {
-        return ClaudeStreamLine::TextDelta(text.to_string());
+        {
+            return ClaudeStreamLine::TextDelta(text.to_string());
+        }
     }
 
     if parsed.get("type").and_then(serde_json::Value::as_str) == Some("error") {
@@ -1899,11 +1901,9 @@ mod tests {
         let args = vec!["-p".to_string(), "hello".to_string()];
         let augmented = ensure_claude_streaming_args(&args);
         assert!(augmented.iter().any(|arg| arg == "--verbose"));
-        assert!(
-            augmented
-                .iter()
-                .any(|arg| arg == "--include-partial-messages")
-        );
+        assert!(augmented
+            .iter()
+            .any(|arg| arg == "--include-partial-messages"));
         assert_eq!(
             claude_output_format(&augmented),
             Some("stream-json".to_string())
@@ -1921,20 +1921,17 @@ mod tests {
         ];
         let augmented = ensure_claude_streaming_args(&args);
         assert_eq!(claude_output_format(&augmented), Some("text".to_string()));
-        assert!(
-            augmented
-                .iter()
-                .any(|arg| arg == "--include-partial-messages")
-        );
+        assert!(augmented
+            .iter()
+            .any(|arg| arg == "--include-partial-messages"));
     }
 
     #[test]
     fn test_build_claude_args_includes_model() {
         let args = build_claude_args("hello", "sonnet");
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
-        );
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
         assert!(args.windows(2).any(|win| win == ["--model", "sonnet"]));
     }
 
@@ -2031,19 +2028,17 @@ mod tests {
     #[test]
     fn test_cmd_rm_requires_name_without_all_clean() {
         let err = cmd_rm(None, false).expect_err("expected missing name error");
-        assert!(
-            err.to_string()
-                .contains("workspace name is required unless --all-clean is set")
-        );
+        assert!(err
+            .to_string()
+            .contains("workspace name is required unless --all-clean is set"));
     }
 
     #[test]
     fn test_cmd_rm_rejects_name_with_all_clean() {
         let err = cmd_rm(Some("foo"), true).expect_err("expected invalid arg combination");
-        assert!(
-            err.to_string()
-                .contains("cannot pass <name> with --all-clean")
-        );
+        assert!(err
+            .to_string()
+            .contains("cannot pass <name> with --all-clean"));
     }
 
     #[test]
