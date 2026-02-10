@@ -23,6 +23,7 @@ fn run() -> Result<()> {
         Commands::New { name, agent_cmd } => cmd_new(&config, &name, &agent_cmd),
         Commands::Status { json } => cmd_status(json),
         Commands::Open { name } => cmd_open(&name),
+        Commands::Rm { name } => cmd_rm(&name),
         Commands::Settle { name } => cmd_settle(&config, name.as_deref()),
     }
 }
@@ -57,6 +58,8 @@ enum Commands {
     },
     /// Open an interactive shell in the workspace.
     Open { name: String },
+    /// Remove a workspace by name.
+    Rm { name: String },
     /// Let Claude integrate a workspace back to main.
     Settle { name: Option<String> },
 }
@@ -334,6 +337,45 @@ fn cmd_open(name: &str) -> Result<()> {
     run_workspace_shell(&workspace_path)
 }
 
+fn cmd_rm(name: &str) -> Result<()> {
+    progress(&format!("rm: resolving workspace `{name}`"));
+    validate_workspace_name(name)?;
+    let repo_root = repo_root()?;
+    let workspace_path = repo_root.join(".worktrees").join(name);
+    if !workspace_path.exists() {
+        bail!("workspace does not exist: {}", workspace_path.display());
+    }
+    if !workspace_path.is_dir() {
+        bail!(
+            "workspace path is not a directory: {}",
+            workspace_path.display()
+        );
+    }
+
+    let workspace_str = path_to_str(&workspace_path)?;
+    let output = run_capture(
+        "git",
+        &["worktree", "remove", "--force", workspace_str],
+        Some(&repo_root),
+    )?;
+    if output.status.success() {
+        progress(&format!("rm: removed workspace `{name}`"));
+        return Ok(());
+    }
+
+    if detect_workspace_backend(&workspace_path) == WorkspaceBackend::Unknown {
+        fs::remove_dir_all(&workspace_path)
+            .with_context(|| format!("failed to remove {}", workspace_path.display()))?;
+        progress(&format!("rm: removed non-git workspace `{name}`"));
+        return Ok(());
+    }
+
+    bail!(
+        "failed to remove git worktree `{name}`: {}",
+        best_error_line(&output.stderr)
+    );
+}
+
 fn cmd_status(as_json: bool) -> Result<()> {
     progress("status: scanning workspaces");
     let repo_root = repo_root()?;
@@ -386,7 +428,7 @@ fn cmd_status(as_json: bool) -> Result<()> {
 
 fn cmd_settle(config: &Config, maybe_name: Option<&str>) -> Result<()> {
     progress("settle: resolving workspace");
-    let repo_root = repo_root()?;
+    let repo_root = repo_common_root()?;
     let worktrees_dir = repo_root.join(".worktrees");
 
     let (name, workspace_path) = match maybe_name {
@@ -762,6 +804,31 @@ fn repo_root() -> Result<PathBuf> {
         bail!("git did not return a repository root");
     }
     Ok(PathBuf::from(root))
+}
+
+fn repo_common_root() -> Result<PathBuf> {
+    let output = run_capture(
+        "git",
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        None,
+    )
+    .context("failed to run git to detect common git dir")?;
+
+    if output.status.success() {
+        let common_dir = PathBuf::from(output.stdout.trim());
+        if let Some(root) = common_root_from_git_common_dir(&common_dir) {
+            return Ok(root);
+        }
+    }
+
+    repo_root()
+}
+
+fn common_root_from_git_common_dir(common_dir: &Path) -> Option<PathBuf> {
+    if common_dir.file_name()? != ".git" {
+        return None;
+    }
+    common_dir.parent().map(Path::to_path_buf)
 }
 
 fn ensure_worktrees_dir(repo_root: &Path) -> Result<(PathBuf, bool)> {
@@ -1239,6 +1306,16 @@ mod tests {
             parse_claude_stream_line(line),
             ClaudeStreamLine::NonJson("plain output\n".to_string())
         );
+    }
+
+    #[test]
+    fn test_common_root_from_git_common_dir() {
+        let root = PathBuf::from("/tmp/repo");
+        let git_common = root.join(".git");
+        let nested = git_common.join("worktrees").join("foo");
+
+        assert_eq!(common_root_from_git_common_dir(&git_common), Some(root));
+        assert_eq!(common_root_from_git_common_dir(&nested), None);
     }
 
     #[test]

@@ -128,6 +128,22 @@ Example:
 sir open foo
 ```
 
+### `sir rm <name>`
+
+Removes workspace `<name>`.
+
+Behavior:
+
+- resolves `repo/.worktrees/<name>`
+- removes git-backed workspaces with `git worktree remove --force`
+- if the workspace is non-git leftovers, deletes the directory directly
+
+Example:
+
+```bash
+sir rm foo
+```
+
 ### `sir settle [<name>]`
 
 Delegates integration of a workspace back to `main` to Claude.

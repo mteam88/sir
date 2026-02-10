@@ -62,7 +62,13 @@ sir status --json
 sir open <name>
 ```
 
-6. Integrate workspace changes back to `main`:
+6. Remove a workspace when you are done with it:
+
+```bash
+sir rm <name>
+```
+
+7. Integrate workspace changes back to `main`:
 
 ```bash
 sir settle <name>

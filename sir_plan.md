@@ -73,6 +73,13 @@ For each workspace:
 ### `sir open <name>`
 Open an interactive shell in the workspace (or print path in non-interactive mode).
 
+### `sir rm <name>`
+Behavior:
+1. Resolve repo root.
+2. Resolve workspace path `repo/.worktrees/<name>`.
+3. Remove with `git worktree remove --force`.
+4. If workspace is non-git leftovers, remove directory directly.
+
 ### `sir settle [<name>]`
 Behavior:
 1. Resolve repo root.
