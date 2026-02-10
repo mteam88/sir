@@ -164,6 +164,7 @@ Behavior:
   - produce clean commit(s) and strong commit messages
   - integrate/rebase/merge onto latest `main`
   - resolve conflicts
+  - not remove/prune the workspace worktree during settle
   - update `.env` when example env files changed (without overwriting secrets)
 - After Claude returns, prints post-check:
   - `git status -sb` at repo root

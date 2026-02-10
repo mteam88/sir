@@ -591,7 +591,7 @@ fn new_init_prompt(workspace_path: &Path) -> String {
 
 fn settle_prompt(name: &str, workspace_path: &Path) -> String {
     format!(
-        "You are in workspace `{name}` at `{}`.\n\nGoal: integrate this workspace back into `main` using git.\n\nRequirements:\n- Inspect changes with git status/diff/log.\n- Ensure changes are in a clean commit (or a small clean commit stack) with excellent commit message quality based on the diff intent.\n- Rebase or merge onto the latest `main` and resolve conflicts.\n- Integrate the result onto `main` using git primitives.\n- If .env.example or any similar example-env file changed, update .env by adding new keys/defaults without overwriting existing secrets.\n- Leave the workspace and main in a sensible state.\n- Run commands directly with no follow-up questions unless absolutely blocked.",
+        "You are in workspace `{name}` at `{}`.\n\nGoal: integrate this workspace back into `main` using git.\n\nRequirements:\n- Inspect changes with git status/diff/log.\n- Ensure changes are in a clean commit (or a small clean commit stack) with excellent commit message quality based on the diff intent.\n- Rebase or merge onto the latest `main` and resolve conflicts.\n- Integrate the result onto `main` using git primitives.\n- Do not remove/delete/prune this worktree (do not run `git worktree remove`); workspace cleanup is handled separately.\n- If .env.example or any similar example-env file changed, update .env by adding new keys/defaults without overwriting existing secrets.\n- Leave the workspace and main in a sensible state.\n- Run commands directly with no follow-up questions unless absolutely blocked.",
         workspace_path.display()
     )
 }
