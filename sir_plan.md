@@ -46,7 +46,7 @@ Checks:
 - `git worktree` support (`git worktree list`)
 - `claude` installed and callable
 
-### `sir spawn <name> <agent_cmd...>`
+### `sir new <name> <agent_cmd...>`
 Behavior:
 1. Resolve repo root.
 2. Ensure `.worktrees/` exists.
@@ -88,6 +88,6 @@ Behavior:
 ## 4) Acceptance criteria
 
 1. `sir doctor` produces actionable output on a fresh repo.
-2. `sir spawn foo codex` creates `.worktrees/foo` as a git worktree and runs `codex` there.
+2. `sir new foo codex` creates `.worktrees/foo` as a git worktree and runs `codex` there.
 3. `sir status` lists `foo` and shows git status.
 4. `sir settle foo` integrates changes into `main` with a clean history.

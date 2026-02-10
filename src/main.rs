@@ -20,7 +20,7 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Doctor => cmd_doctor(&config),
-        Commands::Spawn { name, agent_cmd } => cmd_spawn(&config, &name, &agent_cmd),
+        Commands::New { name, agent_cmd } => cmd_new(&config, &name, &agent_cmd),
         Commands::Status { json } => cmd_status(json),
         Commands::Open { name } => cmd_open(&name),
         Commands::Settle { name } => cmd_settle(&config, name.as_deref()),
@@ -43,12 +43,14 @@ enum Commands {
     /// Run sanity checks and print remediation commands.
     Doctor,
     /// Create/open a workspace and run an agent command in the current terminal.
-    Spawn {
+    #[command(alias = "n")]
+    New {
         name: String,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         agent_cmd: Vec<String>,
     },
     /// Show discovered workspaces and status.
+    #[command(alias = "s")]
     Status {
         #[arg(long)]
         json: bool,
@@ -204,12 +206,12 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         checks.push(Check::ok(
             "Terminal mode",
-            "spawn/open will run directly in this terminal".to_string(),
+            "new/open will run directly in this terminal".to_string(),
         ));
     } else {
         checks.push(Check::ok(
             "Terminal mode",
-            "non-interactive environment detected; spawn/open still run commands but open avoids launching an interactive shell"
+            "non-interactive environment detected; new/open still run commands but open avoids launching an interactive shell"
                 .to_string(),
         ));
     }
@@ -225,8 +227,8 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     }
 }
 
-fn cmd_spawn(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
-    progress(&format!("spawn: preparing workspace `{name}`"));
+fn cmd_new(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
+    progress(&format!("new: preparing workspace `{name}`"));
     validate_workspace_name(name)?;
     let repo_root = repo_root()?;
     let (worktrees_dir, _) = ensure_worktrees_dir(&repo_root)?;
@@ -235,7 +237,7 @@ fn cmd_spawn(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
 
     if workspace_path.is_dir() {
         progress(&format!(
-            "spawn: inspecting existing workspace `{}`",
+            "new: inspecting existing workspace `{}`",
             workspace_path.display()
         ));
         let backend = detect_workspace_backend(&workspace_path);
@@ -268,7 +270,7 @@ fn cmd_spawn(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
     }
 
     if !workspace_path.exists() {
-        progress("spawn: creating git worktree");
+        progress("new: creating git worktree");
         let revision = "HEAD".to_string();
         let workspace_branch = format!("sir/{name}");
         let workspace_str = path_to_str(&workspace_path)?;
@@ -308,15 +310,15 @@ fn cmd_spawn(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
     }
 
     if created_workspace {
-        progress("spawn: applying uncommitted changes from source working tree");
+        progress("new: applying uncommitted changes from source working tree");
         apply_uncommitted_changes(&repo_root, &workspace_path)?;
     }
 
-    progress("spawn: running initialization via Claude");
-    let init_prompt = spawn_init_prompt(&workspace_path);
+    progress("new: running initialization via Claude");
+    let init_prompt = new_init_prompt(&workspace_path);
     run_claude(&config.claude_bin, &init_prompt, &repo_root)?;
 
-    progress("spawn: launching agent command");
+    progress("new: launching agent command");
     run_agent_command(agent_cmd, &workspace_path)
 }
 
@@ -435,7 +437,7 @@ fn run_agent_command(agent_cmd: &[String], workspace_path: &Path) -> Result<()> 
 fn run_agent_command_with_shell(agent_cmd: &[String], workspace_path: &Path) -> Result<()> {
     let zsh = "/bin/zsh";
     if !Path::new(zsh).exists() {
-        bail!("spawn requires `{zsh}` to exist");
+        bail!("new requires `{zsh}` to exist");
     }
 
     let command = shell_join(agent_cmd);
@@ -504,7 +506,7 @@ fn print_command_output(command: &str, stdout: &str, stderr: &str) {
     }
 }
 
-fn spawn_init_prompt(workspace_path: &Path) -> String {
+fn new_init_prompt(workspace_path: &Path) -> String {
     format!(
         "You are in the repo root. Copy initialization data into workspace at:\n{}\n\nRequirements:\n- Copy .env into the workspace if present, but do not overwrite workspace .env if it already exists.\n- Copy target/ into the workspace if present.\n- Copy node_modules/ into the workspace if present.\n- Use copy-on-write on macOS when possible (cp -c). Otherwise use plain recursive copy (cp -R).\n- Never create symlinks.\n- Be conservative and avoid destructive actions.\n- Do not ask questions; execute directly and report what you did.",
         workspace_path.display()
@@ -604,10 +606,10 @@ fn apply_uncommitted_changes(repo_root: &Path, workspace_path: &Path) -> Result<
     }
 
     if diff_output.stdout.trim().is_empty() && copied_untracked == 0 {
-        progress("spawn: no uncommitted changes found in source workspace");
+        progress("new: no uncommitted changes found in source workspace");
     } else if copied_untracked > 0 {
         progress(&format!(
-            "spawn: copied {copied_untracked} untracked file(s) into new workspace"
+            "new: copied {copied_untracked} untracked file(s) into new workspace"
         ));
     }
 

@@ -68,7 +68,7 @@ Checks include:
 - `git worktree` support (`git worktree list`)
 - Claude CLI installed
 
-### `sir spawn <name> <agent_cmd...>`
+### `sir new <name> <agent_cmd...>` (alias: `sir n`)
 
 Creates/opens a workspace and then runs your agent command in that workspace in the current terminal.
 
@@ -95,11 +95,11 @@ Behavior:
 Examples:
 
 ```bash
-sir spawn foo codex
-sir spawn feature-a claude -p "fix failing tests"
+sir new foo codex
+sir n feature-a claude -p "fix failing tests"
 ```
 
-### `sir status [--json]`
+### `sir status [--json]` (alias: `sir s`)
 
 Stateless workspace listing from `.worktrees/` (excluding `_logs`, `_tmp`).
 
@@ -113,7 +113,7 @@ Examples:
 
 ```bash
 sir status
-sir status --json
+sir s --json
 ```
 
 ### `sir open <name>`

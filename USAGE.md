@@ -16,16 +16,17 @@ This file documents the standard day-to-day workflow for `sir`.
 sir doctor
 ```
 
-2. Spawn a workspace and launch your agent inside it:
+2. Create a workspace and launch your agent inside it:
 
 ```bash
-sir spawn <name> <agent_cmd...>
+sir new <name> <agent_cmd...>
+# or: sir n <name> <agent_cmd...>
 ```
 
 Example:
 
 ```bash
-sir spawn feature-auth codex
+sir new feature-auth codex
 ```
 
 What this does:
@@ -46,6 +47,7 @@ git status -sb
 
 ```bash
 sir status
+# or: sir s
 ```
 
 JSON output:
@@ -76,9 +78,9 @@ sir settle
 
 ```bash
 sir doctor
-sir spawn bugfix-42 codex
+sir new bugfix-42 codex
 # ...make changes in .worktrees/bugfix-42...
-sir status
+sir s
 sir settle bugfix-42
 ```
 
