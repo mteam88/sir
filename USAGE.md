@@ -20,19 +20,26 @@ sir doctor
 2. Create a workspace and launch your agent inside it:
 
 ```bash
-sir new <name> <agent_cmd...>
-# or: sir n <name> <agent_cmd...>
+sir new <agent_cmd...>
+# or: sir n <agent_cmd...>
+# optional explicit name:
+sir new --name <name> <agent_cmd...>
+# or: sir n -n <name> <agent_cmd...>
 ```
 
 Example:
 
 ```bash
-sir new feature-auth codex
+sir new codex
+sir n claude -p "add retries to rpc client"
+sir new --name feature-auth codex
 ```
 
 What this does:
 - Creates/uses `.worktrees/<name>`
-- Creates/uses branch `sir/<name>`
+- By default, asks Claude to generate `<name>` from your command and falls back to a generated two-word name (for example `pink elephant`) when Claude returns `null`
+- `--name` / `-n` lets you set `<name>` explicitly
+- Creates/uses a `sir/*` branch derived from `<name>` (whitespace normalized for branch safety)
 - Seeds new workspace with current uncommitted changes from the source repo
 - Runs your agent command in that workspace through `/bin/zsh`
 - Leaves you in a workspace `/bin/zsh` prompt after the agent command exits
@@ -87,7 +94,7 @@ When `sir settle` is run from inside `.worktrees/<name>`, it opens a shell at th
 
 ```bash
 sir doctor
-sir new bugfix-42 codex
+sir new -n bugfix-42 codex
 # ...make changes in .worktrees/bugfix-42...
 sir t
 sir settle bugfix-42

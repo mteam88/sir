@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     if let Err(err) = run() {
@@ -20,7 +21,10 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Doctor => cmd_doctor(&config),
-        Commands::New { name, agent_cmd } => cmd_new(&config, &name, &agent_cmd),
+        Commands::New { name, args } => {
+            let parsed = parse_new_command_args(name, args)?;
+            cmd_new(&config, parsed.name.as_deref(), &parsed.agent_cmd)
+        }
         Commands::Status { json } => cmd_status(json),
         Commands::Open { name } => cmd_open(&name),
         Commands::Rm { name } => cmd_rm(&name),
@@ -46,9 +50,12 @@ enum Commands {
     /// Create/open a workspace and run an agent command in the current terminal.
     #[command(alias = "n")]
     New {
-        name: String,
+        /// Optional explicit workspace name. If omitted, name is generated automatically.
+        #[arg(short = 'n', long)]
+        name: Option<String>,
+        /// Agent command to run in the workspace.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        agent_cmd: Vec<String>,
+        args: Vec<String>,
     },
     /// Show discovered workspaces and status.
     #[command(alias = "t")]
@@ -239,12 +246,39 @@ fn cmd_doctor(config: &Config) -> Result<()> {
     }
 }
 
-fn cmd_new(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
-    progress(&format!("new: preparing workspace `{name}`"));
-    validate_workspace_name(name)?;
+#[derive(Debug)]
+struct ParsedNewCommand {
+    name: Option<String>,
+    agent_cmd: Vec<String>,
+}
+
+fn parse_new_command_args(name: Option<String>, args: Vec<String>) -> Result<ParsedNewCommand> {
+    if args.is_empty() {
+        bail!("agent command must not be empty");
+    }
+
+    if let Some(name) = name {
+        return Ok(ParsedNewCommand {
+            name: Some(name),
+            agent_cmd: args,
+        });
+    }
+
+    Ok(ParsedNewCommand {
+        name: None,
+        agent_cmd: args,
+    })
+}
+
+fn cmd_new(config: &Config, explicit_name: Option<&str>, agent_cmd: &[String]) -> Result<()> {
     let repo_root = repo_root()?;
     let (worktrees_dir, _) = ensure_worktrees_dir(&repo_root)?;
-    let workspace_path = worktrees_dir.join(name);
+    let name =
+        resolve_new_workspace_name(config, explicit_name, agent_cmd, &repo_root, &worktrees_dir)?;
+
+    progress(&format!("new: preparing workspace `{name}`"));
+    validate_workspace_name(&name)?;
+    let workspace_path = worktrees_dir.join(&name);
     let mut created_workspace = false;
 
     if workspace_path.is_dir() {
@@ -284,7 +318,7 @@ fn cmd_new(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
     if !workspace_path.exists() {
         progress("new: creating git worktree");
         let revision = "HEAD".to_string();
-        let workspace_branch = format!("sir/{name}");
+        let workspace_branch = workspace_branch_name(&repo_root, &name)?;
         let workspace_str = path_to_str(&workspace_path)?;
         let output = if git_branch_exists(&repo_root, &workspace_branch) {
             run_capture(
@@ -332,6 +366,204 @@ fn cmd_new(config: &Config, name: &str, agent_cmd: &[String]) -> Result<()> {
 
     progress("new: launching agent command");
     run_agent_command(agent_cmd, &workspace_path)
+}
+
+fn resolve_new_workspace_name(
+    config: &Config,
+    explicit_name: Option<&str>,
+    agent_cmd: &[String],
+    repo_root: &Path,
+    worktrees_dir: &Path,
+) -> Result<String> {
+    if let Some(name) = explicit_name {
+        validate_workspace_name(name)?;
+        return Ok(name.to_string());
+    }
+
+    progress("new: generating workspace name via Claude");
+    let command = shell_join(agent_cmd);
+    let claude_result = suggest_workspace_name_from_claude(config, &command, repo_root);
+    let mut selected = match claude_result {
+        Ok(Some(name)) => name,
+        Ok(None) => fallback_workspace_name(worktrees_dir),
+        Err(err) => {
+            eprintln!("warning: failed to generate workspace name via Claude: {err}");
+            fallback_workspace_name(worktrees_dir)
+        }
+    };
+
+    if validate_workspace_name(&selected).is_err() {
+        selected = fallback_workspace_name(worktrees_dir);
+    }
+
+    progress(&format!("new: selected workspace name `{selected}`"));
+    Ok(selected)
+}
+
+fn suggest_workspace_name_from_claude(
+    config: &Config,
+    agent_command: &str,
+    cwd: &Path,
+) -> Result<Option<String>> {
+    let prompt = auto_name_prompt(agent_command);
+    let output = run_claude_text(config, &prompt, cwd)?;
+    Ok(parse_auto_name_response(&output))
+}
+
+fn auto_name_prompt(agent_command: &str) -> String {
+    format!(
+        "You generate short workspace names for git worktrees.
+
+Task:
+- Read this command that the user will run inside the new workspace.
+- If the command is too vague to infer intent, return null.
+- Otherwise return a short memorable name.
+
+Command:
+{agent_command}
+
+Rules:
+- Return exactly one line.
+- Output must be either:
+  1) null
+  2) a plain text name (1-4 words, lowercase, no punctuation except spaces, hyphen, underscore, or dot)
+- No quotes, no markdown, no extra commentary."
+    )
+}
+
+fn run_claude_text(config: &Config, prompt: &str, cwd: &Path) -> Result<String> {
+    let args = build_claude_text_args(prompt, &config.claude_model);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_capture(&config.claude_bin, &arg_refs, Some(cwd))
+        .with_context(|| format!("failed while running `{}`", config.claude_bin))?;
+    if !output.status.success() {
+        bail!(
+            "failed while running `{}`: {}",
+            config.claude_bin,
+            best_error_line(&output.stderr)
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn build_claude_text_args(prompt: &str, model: &str) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        prompt.to_string(),
+        "--output-format".to_string(),
+        "text".to_string(),
+    ];
+    if !model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(model.trim().to_string());
+    }
+    args
+}
+
+fn parse_auto_name_response(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return parse_auto_name_json(&value);
+    }
+
+    let candidate = trimmed
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("```"))
+        .unwrap_or("");
+    normalize_auto_name_candidate(candidate)
+}
+
+fn parse_auto_name_json(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(name) => normalize_auto_name_candidate(name),
+        serde_json::Value::Object(map) => {
+            let name = map.get("name")?;
+            if name.is_null() {
+                return None;
+            }
+            name.as_str().and_then(normalize_auto_name_candidate)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_auto_name_candidate(candidate: &str) -> Option<String> {
+    let raw = candidate.trim().trim_matches('`').trim_matches('"').trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
+        return None;
+    }
+
+    let mut normalized = String::new();
+    let mut previous_space = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_space = false;
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !normalized.is_empty() && !previous_space {
+                normalized.push(' ');
+            }
+            previous_space = true;
+        }
+    }
+
+    let normalized = normalized.trim().to_string();
+    if normalized.is_empty() || normalized.eq_ignore_ascii_case("null") {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn fallback_workspace_name(worktrees_dir: &Path) -> String {
+    const ADJECTIVES: &[&str] = &[
+        "pink", "brisk", "crisp", "lucky", "quiet", "rapid", "sunny", "tidy", "witty", "bold",
+        "swift", "fuzzy",
+    ];
+    const NOUNS: &[&str] = &[
+        "elephant", "otter", "falcon", "harbor", "forest", "rocket", "lantern", "meadow", "beacon",
+        "comet", "panther", "sailor",
+    ];
+
+    for attempt in 0..100u64 {
+        let adjective = ADJECTIVES[pseudo_random_index(ADJECTIVES.len(), attempt)];
+        let noun = NOUNS[pseudo_random_index(NOUNS.len(), attempt + 97)];
+        let base = format!("{adjective} {noun}");
+        if !worktrees_dir.join(&base).exists() {
+            return base;
+        }
+        let with_suffix = format!("{base} {}", attempt + 2);
+        if !worktrees_dir.join(&with_suffix).exists() {
+            return with_suffix;
+        }
+    }
+
+    "pink elephant".to_string()
+}
+
+fn pseudo_random_index(len: usize, salt: u64) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    let mut value = nanos ^ pid.rotate_left(17) ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    value ^= value >> 33;
+    (value as usize) % len
 }
 
 fn cmd_open(name: &str) -> Result<()> {
@@ -615,6 +847,78 @@ fn build_claude_args(prompt: &str, model: &str) -> Vec<String> {
     ensure_claude_streaming_args(&args)
 }
 
+fn workspace_branch_name(repo_root: &Path, workspace_name: &str) -> Result<String> {
+    let replaced_whitespace = collapse_whitespace_with_hyphen(workspace_name);
+    let direct = format!("sir/{replaced_whitespace}");
+    if git_branch_name_valid(repo_root, &direct) {
+        return Ok(direct);
+    }
+
+    let slug = slugify_branch_component(workspace_name);
+    if slug.is_empty() {
+        bail!("workspace name `{workspace_name}` cannot be converted to a valid git branch name");
+    }
+    let fallback = format!("sir/{slug}");
+    if git_branch_name_valid(repo_root, &fallback) {
+        return Ok(fallback);
+    }
+
+    bail!("workspace name `{workspace_name}` cannot be converted to a valid git branch name");
+}
+
+fn collapse_whitespace_with_hyphen(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_hyphen = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if !output.is_empty() && !last_hyphen {
+                output.push('-');
+            }
+            last_hyphen = true;
+        } else {
+            output.push(ch);
+            last_hyphen = false;
+        }
+    }
+    output.trim_matches('-').to_string()
+}
+
+fn slugify_branch_component(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_separator = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            let mut next = ch.to_ascii_lowercase();
+            if next == '.' && output.ends_with('.') {
+                next = '-';
+            }
+            output.push(next);
+            last_separator = next == '-';
+            continue;
+        }
+
+        if !output.is_empty() && !last_separator {
+            output.push('-');
+            last_separator = true;
+        }
+    }
+
+    let mut output = output.trim_matches(['-', '.']).to_string();
+    while output.contains("..") {
+        output = output.replace("..", ".");
+    }
+    while output.contains(".-") {
+        output = output.replace(".-", "-");
+    }
+    while output.contains("-.") {
+        output = output.replace("-.", "-");
+    }
+    while output.contains("--") {
+        output = output.replace("--", "-");
+    }
+    output.trim_matches(['-', '.']).to_string()
+}
+
 fn progress(message: &str) {
     eprintln!("==> {message}");
 }
@@ -827,6 +1131,9 @@ fn validate_workspace_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("workspace name must not be empty");
     }
+    if name == "." || name == ".." {
+        bail!("workspace name `{name}` is invalid");
+    }
     if name == "_logs" || name == "_tmp" {
         bail!("workspace name `{name}` is reserved");
     }
@@ -1024,6 +1331,16 @@ fn git_branch_exists(repo_root: &Path, branch: &str) -> bool {
             "--quiet",
             &format!("refs/heads/{branch}"),
         ],
+        Some(repo_root),
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
+}
+
+fn git_branch_name_valid(repo_root: &Path, branch: &str) -> bool {
+    run_capture(
+        "git",
+        &["check-ref-format", "--branch", branch],
         Some(repo_root),
     )
     .map(|output| output.status.success())
@@ -1450,5 +1767,90 @@ mod tests {
             "hello world".to_string(),
         ];
         assert_eq!(shell_join(&args), "claude -p 'hello world'");
+    }
+
+    #[test]
+    fn test_parse_new_command_args_named_flag() {
+        let parsed = parse_new_command_args(
+            Some("feature".to_string()),
+            vec!["claude".to_string(), "-p".to_string()],
+        )
+        .expect("parse args");
+
+        assert_eq!(parsed.name.as_deref(), Some("feature"));
+        assert_eq!(
+            parsed.agent_cmd,
+            vec!["claude".to_string(), "-p".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_new_command_args_auto_default() {
+        let parsed = parse_new_command_args(None, vec!["claude".to_string(), "-p".to_string()])
+            .expect("parse args");
+
+        assert_eq!(parsed.name, None);
+        assert_eq!(
+            parsed.agent_cmd,
+            vec!["claude".to_string(), "-p".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_new_command_args_missing_agent_command() {
+        let err = parse_new_command_args(None, vec![]).expect_err("error");
+        assert!(
+            err.to_string().contains("agent command must not be empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_auto_name_response_handles_json_and_null() {
+        assert_eq!(parse_auto_name_response("null"), None);
+        assert_eq!(
+            parse_auto_name_response("\"pink elephant\""),
+            Some("pink elephant".to_string())
+        );
+        assert_eq!(
+            parse_auto_name_response("{\"name\":\"Fix API Tests\"}"),
+            Some("fix api tests".to_string())
+        );
+        assert_eq!(parse_auto_name_response("{\"name\":null}"), None);
+    }
+
+    #[test]
+    fn test_normalize_auto_name_candidate_filters_noise() {
+        assert_eq!(
+            normalize_auto_name_candidate("  `Feature: Fix tests!`  "),
+            Some("feature fix tests".to_string())
+        );
+        assert_eq!(normalize_auto_name_candidate(""), None);
+        assert_eq!(normalize_auto_name_candidate("NULL"), None);
+    }
+
+    #[test]
+    fn test_collapse_whitespace_with_hyphen() {
+        assert_eq!(
+            collapse_whitespace_with_hyphen("pink    elephant"),
+            "pink-elephant"
+        );
+        assert_eq!(
+            collapse_whitespace_with_hyphen("  hello world "),
+            "hello-world"
+        );
+    }
+
+    #[test]
+    fn test_slugify_branch_component() {
+        assert_eq!(slugify_branch_component("Fix API tests"), "fix-api-tests");
+        assert_eq!(slugify_branch_component("...wow..ok..."), "wow-ok");
+        assert_eq!(slugify_branch_component("###"), "");
+    }
+
+    #[test]
+    fn test_validate_workspace_name_rejects_dot_paths() {
+        assert!(validate_workspace_name(".").is_err());
+        assert!(validate_workspace_name("..").is_err());
     }
 }

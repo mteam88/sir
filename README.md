@@ -71,17 +71,22 @@ Checks include:
 - `git worktree` support (`git worktree list`)
 - Claude CLI installed
 
-### `sir new <name> <agent_cmd...>` (alias: `sir n`)
+### `sir new <agent_cmd...>` / `sir new --name <name> <agent_cmd...>` (alias: `sir n`)
 
 Creates/opens a workspace and then runs your agent command in that workspace in the current terminal.
 
 Behavior:
 
 - Ensures `.worktrees/`
+- Uses automatic naming by default:
+  - sends your full `<agent_cmd...>` to Claude and asks for a short workspace name
+  - if Claude returns `null` (or invalid output), falls back to a generated two-word name (for example: `pink elephant`)
+- Use `--name` / `-n` when you want an explicit workspace name
 - Creates new worktrees from `HEAD`
-- Creates a worktree branch named `sir/<name>`:
-  - if branch exists: `git worktree add repo/.worktrees/<name> sir/<name>`
-  - else: `git worktree add -b sir/<name> repo/.worktrees/<name> HEAD`
+- Creates a worktree branch under `sir/*`:
+  - derived from the workspace name (whitespace collapsed to `-` for branch safety)
+  - if branch exists: `git worktree add repo/.worktrees/<name> <branch>`
+  - else: `git worktree add -b <branch> repo/.worktrees/<name> HEAD`
 - Newly created worktrees are seeded with current uncommitted changes from the source repo by default
   - applies tracked staged/unstaged diff from `HEAD`
   - copies untracked files (excluding ignored files)
@@ -99,8 +104,10 @@ Behavior:
 Examples:
 
 ```bash
-sir new foo codex
-sir n feature-a claude -p "fix failing tests"
+sir new claude -p "fix flaky indexing test"
+sir n codex
+sir new --name feature-a claude -p "fix failing tests"
+sir n -n bugfix-42 codex
 ```
 
 ### `sir status [--json]` (alias: `sir t`)
