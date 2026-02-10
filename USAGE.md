@@ -78,6 +78,8 @@ sir open <name>
 
 ```bash
 sir rm <name>
+# remove all workspaces with no unstaged/untracked changes:
+sir rm --all-clean
 ```
 
 7. Integrate workspace changes back to `main`:

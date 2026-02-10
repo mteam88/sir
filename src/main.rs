@@ -32,7 +32,7 @@ fn run() -> Result<()> {
         }
         Commands::Status { json } => cmd_status(json),
         Commands::Open { name } => cmd_open(&name),
-        Commands::Rm { name } => cmd_rm(&name),
+        Commands::Rm { name, all_clean } => cmd_rm(name.as_deref(), all_clean),
         Commands::Settle { name, prompt } => {
             cmd_settle(&config, name.as_deref(), prompt.as_deref())
         }
@@ -75,8 +75,14 @@ enum Commands {
     },
     /// Open an interactive shell in the workspace.
     Open { name: String },
-    /// Remove a workspace by name.
-    Rm { name: String },
+    /// Remove a workspace by name, or remove all clean workspaces.
+    Rm {
+        /// Workspace name. Omit when using `--all-clean`.
+        name: Option<String>,
+        /// Remove all workspaces that have no unstaged or untracked changes.
+        #[arg(long)]
+        all_clean: bool,
+    },
     /// Let Claude integrate a workspace back to main.
     #[command(alias = "s")]
     Settle {
@@ -617,7 +623,19 @@ fn cmd_open(name: &str) -> Result<()> {
     run_workspace_shell(&workspace_path)
 }
 
-fn cmd_rm(name: &str) -> Result<()> {
+fn cmd_rm(name: Option<&str>, all_clean: bool) -> Result<()> {
+    if all_clean {
+        if name.is_some() {
+            bail!("cannot pass <name> with --all-clean");
+        }
+        return cmd_rm_all_clean();
+    }
+
+    let name = name.context("workspace name is required unless --all-clean is set")?;
+    cmd_rm_single(name)
+}
+
+fn cmd_rm_single(name: &str) -> Result<()> {
     progress(&format!("rm: resolving workspace `{name}`"));
     validate_workspace_name(name)?;
     let repo_root = repo_root()?;
@@ -654,6 +672,57 @@ fn cmd_rm(name: &str) -> Result<()> {
         "failed to remove git worktree `{name}`: {}",
         best_error_line(&output.stderr)
     );
+}
+
+fn cmd_rm_all_clean() -> Result<()> {
+    progress("rm: scanning for clean workspaces");
+    let repo_root = repo_root()?;
+    let worktrees_dir = repo_root.join(".worktrees");
+    let entries = list_workspace_dirs(&worktrees_dir)?;
+    if entries.is_empty() {
+        println!("No workspaces found under {}", worktrees_dir.display());
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    let mut skipped_dirty = 0usize;
+    let mut skipped_non_git = 0usize;
+    let mut failures = Vec::new();
+
+    for (name, path) in entries {
+        if detect_workspace_backend(&path) != WorkspaceBackend::Git {
+            skipped_non_git += 1;
+            continue;
+        }
+
+        match workspace_has_unstaged_changes(&path) {
+            Ok(true) => {
+                skipped_dirty += 1;
+            }
+            Ok(false) => {
+                progress(&format!("rm: removing clean workspace `{name}`"));
+                if let Err(err) = cmd_rm_single(&name) {
+                    failures.push(format!("{name}: {err:#}"));
+                } else {
+                    removed += 1;
+                }
+            }
+            Err(err) => failures.push(format!("{name}: {err:#}")),
+        }
+    }
+
+    println!(
+        "rm --all-clean: removed {removed}, skipped dirty {skipped_dirty}, skipped non-git {skipped_non_git}"
+    );
+
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("- {failure}");
+        }
+        bail!("rm --all-clean failed for {} workspace(s)", failures.len());
+    }
+
+    Ok(())
 }
 
 fn cmd_status(as_json: bool) -> Result<()> {
@@ -1165,6 +1234,32 @@ fn squash_status_lines(raw: &str) -> String {
     } else {
         lines.join(" | ")
     }
+}
+
+fn workspace_has_unstaged_changes(workspace_path: &Path) -> Result<bool> {
+    let output = run_capture("git", &["status", "--porcelain"], Some(workspace_path))
+        .with_context(|| format!("failed to read status for {}", workspace_path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "failed to read status for {}: {}",
+            workspace_path.display(),
+            best_error_line(&output.stderr)
+        );
+    }
+
+    Ok(output
+        .stdout
+        .lines()
+        .map(str::trim_end)
+        .any(porcelain_line_has_unstaged_changes))
+}
+
+fn porcelain_line_has_unstaged_changes(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    if bytes.len() < 2 {
+        return true;
+    }
+    bytes[1] != b' '
 }
 
 fn truncate(value: &str, max: usize) -> String {
@@ -1907,6 +2002,56 @@ mod tests {
             err.to_string().contains("agent command must not be empty"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_rm_command_parse_name() {
+        let cli = Cli::try_parse_from(["sir", "rm", "foo"]).expect("parse rm name");
+        match cli.command {
+            Commands::Rm { name, all_clean } => {
+                assert_eq!(name.as_deref(), Some("foo"));
+                assert!(!all_clean);
+            }
+            _ => panic!("expected rm command"),
+        }
+    }
+
+    #[test]
+    fn test_rm_command_parse_all_clean() {
+        let cli = Cli::try_parse_from(["sir", "rm", "--all-clean"]).expect("parse rm all clean");
+        match cli.command {
+            Commands::Rm { name, all_clean } => {
+                assert_eq!(name, None);
+                assert!(all_clean);
+            }
+            _ => panic!("expected rm command"),
+        }
+    }
+
+    #[test]
+    fn test_cmd_rm_requires_name_without_all_clean() {
+        let err = cmd_rm(None, false).expect_err("expected missing name error");
+        assert!(
+            err.to_string()
+                .contains("workspace name is required unless --all-clean is set")
+        );
+    }
+
+    #[test]
+    fn test_cmd_rm_rejects_name_with_all_clean() {
+        let err = cmd_rm(Some("foo"), true).expect_err("expected invalid arg combination");
+        assert!(
+            err.to_string()
+                .contains("cannot pass <name> with --all-clean")
+        );
+    }
+
+    #[test]
+    fn test_porcelain_line_has_unstaged_changes() {
+        assert!(!porcelain_line_has_unstaged_changes("M  src/main.rs"));
+        assert!(!porcelain_line_has_unstaged_changes("A  src/main.rs"));
+        assert!(porcelain_line_has_unstaged_changes(" M src/main.rs"));
+        assert!(porcelain_line_has_unstaged_changes("?? src/new.rs"));
     }
 
     #[test]

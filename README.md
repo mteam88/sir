@@ -142,20 +142,28 @@ Example:
 sir open foo
 ```
 
-### `sir rm <name>`
+### `sir rm [<name>] [--all-clean]`
 
-Removes workspace `<name>`.
+Removes workspace `<name>`, or removes all clean workspaces with `--all-clean`.
 
 Behavior:
 
-- resolves `repo/.worktrees/<name>`
-- removes git-backed workspaces with `git worktree remove --force`
-- if the workspace is non-git leftovers, deletes the directory directly
+- `sir rm <name>`:
+  - resolves `repo/.worktrees/<name>`
+  - removes git-backed workspaces with `git worktree remove --force`
+  - if the workspace is non-git leftovers, deletes the directory directly
+- `sir rm --all-clean`:
+  - scans all directories under `repo/.worktrees/` (excluding reserved dirs)
+  - for git-backed workspaces, checks `git status --porcelain`
+  - removes only workspaces with no unstaged/untracked changes
+  - skips dirty workspaces (including untracked files)
+  - staged-only changes are treated as clean for this check
 
 Example:
 
 ```bash
 sir rm foo
+sir rm --all-clean
 ```
 
 ### `sir settle [<name>] [--prompt <text>]` (alias: `sir s`)
