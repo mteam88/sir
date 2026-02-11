@@ -72,16 +72,8 @@ pub(crate) fn parse_new_command_args(
         bail!("agent command must not be empty");
     }
 
-    if let Some(name) = name {
-        return Ok(ParsedNewCommand {
-            name: Some(name),
-            from,
-            agent_cmd: args,
-        });
-    }
-
     Ok(ParsedNewCommand {
-        name: None,
+        name,
         from,
         agent_cmd: args,
     })

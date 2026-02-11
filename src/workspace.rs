@@ -224,20 +224,17 @@ pub(crate) fn workspace_is_metadata_only(workspace_path: &Path) -> Result<bool> 
         return Ok(false);
     }
 
-    let mut saw_non_metadata_entry = false;
     for entry in fs::read_dir(workspace_path)
         .with_context(|| format!("failed to read workspace {}", workspace_path.display()))?
     {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".git" {
-            continue;
+        if name != ".git" {
+            return Ok(false);
         }
-        saw_non_metadata_entry = true;
-        break;
     }
 
-    Ok(!saw_non_metadata_entry)
+    Ok(true)
 }
 
 pub(crate) fn workspace_has_tracked_content(
@@ -263,11 +260,7 @@ pub(crate) fn workspace_has_tracked_content(
         }
     }
 
-    if !saw_any_tracked {
-        return Ok(true);
-    }
-
-    Ok(false)
+    Ok(!saw_any_tracked)
 }
 
 pub(crate) fn path_is_within_dir(path: &Path, dir: &Path) -> bool {
@@ -355,7 +348,8 @@ pub(crate) fn list_external_git_workspaces(
 }
 
 pub(crate) fn parse_workspace_index(value: &str) -> Option<usize> {
-    let candidate = value.trim().strip_prefix('#').unwrap_or(value.trim());
+    let trimmed = value.trim();
+    let candidate = trimmed.strip_prefix('#').unwrap_or(trimmed);
     let parsed = candidate.parse::<usize>().ok()?;
     if parsed == 0 {
         return None;

@@ -509,13 +509,17 @@ fn cmd_status(as_json: bool) -> Result<()> {
     let rows: Vec<StatusRow> = records
         .into_iter()
         .enumerate()
-        .map(|(offset, record)| StatusRow {
-            index: offset + 1,
-            name: record.name,
-            path: record.path.clone(),
-            backend: record.backend,
-            source: record.source,
-            summary: workspace_status_summary(record.backend, &record.path),
+        .map(|(offset, record)| {
+            let path = record.path;
+            let summary = workspace_status_summary(record.backend, &path);
+            StatusRow {
+                index: offset + 1,
+                name: record.name,
+                path,
+                backend: record.backend,
+                source: record.source,
+                summary,
+            }
         })
         .collect();
 
